@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "map": {
+    "lon": 151.20543479919434,
+    "lat": -33.85256174306036,
+    "zoom": 14
+  },
+  "shape_kind": "hexagon",
+  "shape_params": {
+    "center_lon": 151.20526313781738,
+    "center_lat": -33.86353817877295,
+    "radius_m": 2173.831123875214,
+    "area": 1227.731756610578
+  },
+  "params": {
+    "RESOLUTION_M": 5,
+    "SIZE_MM": 120,
+    "BASE_THICKNESS": 20,
+    "ROAD_WIDTH_PX": 1,
+    "ROAD_HEIGHT": 6,
+    "RIVER_WIDTH_PX": 3,
+    "WATER_HEIGHT": 3,
+    "MIN_WATER_AREA_M2": 5000,
+    "MIN_WATERWAY_LENGTH_M": 500,
+    "TREE_HEIGHT": 3,
+    "TREE_RADIUS": 1.5,
+    "TREE_DENSITY": 0.008,
+    "MIN_BUILDING_AREA_M2": 250,
+    "DEFAULT_BUILDING_HEIGHT_M": 6,
+    "METERS_PER_LEVEL": 3,
+    "BUILDING_HEIGHT_SCALE": 10,
+    "BUILDING_MIN_HEIGHT": 2,
+    "BUILDING_MAX_HEIGHT": 20,
+    "GPXZ_API_KEY": "ak_0KtNnPbu_v9orPuogXRYmTu0p",
+    "CACHE_DIR": "cache",
+    "STL_DIR": "STL",
+    "ROAD_LEVELS": [
+      "motorway",
+      "trunk",
+      "primary",
+      "secondary",
+      "tertiary",
+      "residential",
+      "motorway_link",
+      "trunk_link",
+      "primary_link",
+      "secondary_link",
+      "tertiary_link",
+      "residential_link"
+    ],
+    "ENABLED_LAYERS": [
+      "terrain",
+      "roads",
+      "water",
+      "vegetation",
+      "trees",
+      "buildings"
+    ]
+  },
+  "excluded_ids": []
+}
