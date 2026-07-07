@@ -1,7 +1,9 @@
 import os
+import math
 import sys
 import traceback
 import json
+import copy
 
 os.system("cls")
 
@@ -13,7 +15,7 @@ sys.excepthook = excepthook
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QLabel, QTextEdit, QMessageBox, QButtonGroup, QRadioButton,
-    QFormLayout, QFrame, QSizePolicy, QTabWidget, QGroupBox, QCheckBox, QGridLayout, QFileDialog, QSpinBox, QDoubleSpinBox, QLineEdit
+    QFormLayout, QFrame, QSizePolicy, QTabWidget, QGroupBox, QCheckBox, QGridLayout, QFileDialog, QSpinBox, QDoubleSpinBox, QLineEdit, QSlider
 )
 from PyQt6.QtCore import Qt, qInstallMessageHandler, QTimer
 from PyQt6.QtGui import QGuiApplication
@@ -25,43 +27,44 @@ from stl_viewer import StlViewerPanel
 from preview_worker import PreviewWorker, PreviewWorkerAll
 from overpass_status_widget import OverpassStatusWidget
 from constants import TOPIC_COLORS, checkbox_style
+from shape_edit_dialog import ShapeEditDialog
 import topopixel as tp
 
 RIGHT_PANEL_STYLESHEET = """
 QWidget#rightPanel {
-    background-color: #F1F3F5;
+    background-color: #2B2B2B;
 }
 QLabel#sectionHint {
-    color: #495057;
+    color: #999999;
     font-size: 11px;
 }
 QRadioButton {
     padding: 3px 0;
-    color: #212529;
+    color: #DDDDDD;
 }
 QRadioButton::indicator {
     width: 15px;
     height: 15px;
     border-radius: 8px;
     border: 1.5px solid #ADB5BD;
-    background-color: #FFFFFF;
+    background-color: #3C3C3C;
 }
 QRadioButton::indicator:checked {
     background-color: #4C6EF5;
     border: 1.5px solid #4C6EF5;
 }
 QPushButton {
-    background-color: #E9ECEF;
-    border: 1px solid #CED4DA;
+    background-color: #3C3C3C;
+    border: 1px solid #555555;
     border-radius: 6px;
     padding: 6px 10px;
-    color: #212529;
+    color: #DDDDDD;
 }
 QPushButton:hover {
-    background-color: #DEE2E6;
+    background-color: #4A4A4A ;
 }
 QPushButton:pressed {
-    background-color: #CED4DA;
+    background-color: #2F2F2F;
 }
 QPushButton#generateButton {
     background-color: #2F9E44;
@@ -120,7 +123,7 @@ class StaticSection(QFrame):
         self.body.setObjectName("sectionBody")
         self.body.setStyleSheet(f"""
             QWidget#sectionBody {{
-                background-color: #FFFFFF;
+                background-color: #2B2B2B;
                 border: 2px solid {accent};
                 border-top: none;
                 border-bottom-left-radius: 8px;
@@ -293,6 +296,12 @@ QPushButton:disabled {
         info_form.addRow("Type", self._lbl_kind)
         info_form.addRow("Détails", self._lbl_details)
         info_box.add_layout(info_form)
+        
+        self._btn_edit_shape = QPushButton("✏️")
+        self._btn_edit_shape.setVisible(False)
+        self._btn_edit_shape.clicked.connect(self._on_edit_shape)
+        info_box.add_widget(self._btn_edit_shape)
+        
         layout.addWidget(info_box)
 
         self.canvas.shape_changed.connect(self._on_shape_changed)
@@ -377,6 +386,10 @@ QPushButton:disabled {
             self.clear_btn.show()
             self._gen_button.setVisible(True)
             
+        self._btn_edit_shape.setVisible(
+            shape is not None and kind in ("rect", "polygon")
+        )
+            
     def _on_generate(self):
     
         win = self.window()
@@ -396,6 +409,8 @@ QPushButton:disabled {
         kind, params = shape
         ui_params = self._param_panel_ref.get_params()
         ui_params["EXCLUDED_IDS"] = self.canvas.get_excluded_ids()
+        ui_params["PROJECT_NAME"] = getattr(self.window(), '_project_name', 'topopixel')
+        ui_params["GPX_LIST"] = self._param_panel_ref.get_gpx_list()
 
         self._log.clear()
         self._log.setVisible(True)
@@ -429,6 +444,11 @@ QPushButton:disabled {
         if hasattr(self, '_stl_viewer') and self._stl_viewer is not None:
             stl_dir = self._param_panel_ref.get_params().get("STL_DIR", "STL") if self._param_panel_ref else "STL"
             self._stl_viewer.reload_stl_folder(stl_dir)
+            win = self.window()
+            if hasattr(win, 'tabs'):
+                win.tabs.setTabEnabled(1, True)
+            self._stl_viewer._btn_export_3mf.setVisible(True)
+            self._stl_viewer._current_stl_dir = stl_dir
         win = self.window()
         if hasattr(win, 'tabs'):
             win.tabs.setCurrentIndex(1)
@@ -488,7 +508,7 @@ QPushButton:disabled {
         if count == 0:
             self._preview_status[layer].setText("aucun élément")
         else:
-            self._preview_status[layer].setText(f"{count} éléments")
+            self._preview_status[layer].setText(f"{count} éléments affichés")
 
     def _on_stop_preview(self):
         win = self.window()
@@ -513,7 +533,44 @@ QPushButton:disabled {
         self._gen_button.clicked.disconnect()
         self._gen_button.clicked.connect(self._on_generate)
         self._log.setVisible(False)
-    
+        
+    def _on_edit_shape(self):
+        shape = self.canvas.current_shape()
+        if shape is None:
+            return
+        kind, params = shape
+        params_backup = copy.deepcopy(params)
+        dialog = ShapeEditDialog(kind, params, self)
+        dialog.vertex_focused.connect(self.canvas._highlight_vertex)
+        dialog.vertex_unfocused.connect(self.canvas._unhighlight_vertex)
+        dialog.coords_changed.connect(lambda p: self._apply_shape_preview(kind, p))
+        if dialog.exec() == ShapeEditDialog.DialogCode.Accepted:
+            result = dialog.get_result()
+            import math
+            p = result
+            if kind == "rect":
+                lat_mid = (p["north"] + p["south"]) / 2
+                p["width"] = abs(p["east"] - p["west"]) * 111320 * math.cos(math.radians(lat_mid))
+                p["height"] = abs(p["north"] - p["south"]) * 111320
+                p["area"] = p["width"] * p["height"] / 10000
+            elif kind == "polygon":
+                poly = Polygon([(lon, lat) for lon, lat in p["points"]])
+                gdf = gpd.GeoDataFrame(geometry=[poly], crs="EPSG:4326").to_crs("EPSG:3857")
+                p["area"] = gdf.geometry.area.iloc[0] / 10000
+            self.canvas._shape_params = p
+            self.canvas._redraw_shape()
+            self.canvas._draw_vertices()
+            self.canvas.shape_changed.emit()
+        else:
+            self.canvas._shape_params = params_backup
+            self.canvas._redraw_shape()
+            self.canvas._draw_vertices()
+
+    def _apply_shape_preview(self, kind, params):
+        self.canvas._shape_params = params
+        self.canvas._redraw_shape()
+        self.canvas._draw_vertices()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -564,6 +621,7 @@ class MainWindow(QMainWindow):
 
         self.stl_viewer = StlViewerPanel()
         self.tabs.addTab(self.stl_viewer, "Prévisualisation STL")
+        self.tabs.setTabEnabled(1, False)
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         main_layout.addWidget(self.tabs)
@@ -572,7 +630,6 @@ class MainWindow(QMainWindow):
         has_stl = os.path.isdir(stl_folder) and any(
             f.endswith(".stl") for f in os.listdir(stl_folder)
         ) if os.path.isdir(stl_folder) else False
-        self.tabs.setTabEnabled(1, has_stl)
         
         self._overpass_status = OverpassStatusWidget()
         self._overpass_status.refresh()
@@ -586,10 +643,15 @@ class MainWindow(QMainWindow):
         self.param_panel.road_levels_changed.connect(self._on_road_levels_changed)
         self.param_panel.water_filter_changed.connect(self._on_water_filter_changed)
         self.param_panel.building_filter_changed.connect(self._on_building_filter_changed)
+        self.param_panel.color_changed.connect(self._on_color_changed)
         
         self.map_canvas.setEnabled(False)
         self._gen_locked = True
+        
         self._overpass_status.strategy_changed.connect(self._on_overpass_ready)
+        self.map_canvas._tooltip.exclusion_changed.connect(self._on_exclusion_changed_count)
+        self.param_panel.gpx_changed.connect(self._on_gpx_changed)
+        self.param_panel.cache_coverage_toggled.connect(self._on_cache_coverage_toggled)
         
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -676,7 +738,7 @@ class MainWindow(QMainWindow):
             layers_to_preview.append("vegetation")
         if "buildings" in enabled:
             layers_to_preview.append("buildings")
-
+        
         if strategy == "parallel":
             for layer in layers_to_preview:
                 self._launch_preview_worker(layer, bbox, cache_dir)
@@ -706,23 +768,26 @@ class MainWindow(QMainWindow):
         self.right_panel._btn_stop_preview.setVisible(True)
         w.start()
 
+    def _count_layer(self, layer):
+        excluded = self.map_canvas._tooltip._excluded_ids
+        excluded_for_layer = {osm_id for t, osm_id in excluded if t == ("road" if layer == "roads" else layer)}
+        items = self.map_canvas._osm_preview_items.get(layer, [])
+        seen_ids = set()
+        counted = 0
+        for item in items:
+            data = item.data(0)
+            if not data:
+                continue
+            osm_id = str(data.get("osm_id", ""))
+            if osm_id in seen_ids:
+                continue
+            seen_ids.add(osm_id)
+            if osm_id in excluded_for_layer:
+                continue
+            counted += 1
+        return counted
+
     def _on_preview_ready(self, layer, data):
-        def safe_len(gdf):
-            return 0 if gdf is None else len(gdf)
-
-        if layer == "roads":
-            count = sum(len(v) for v in data.values())
-        elif layer == "water":
-            count = safe_len(data.get("water_areas")) + safe_len(data.get("waterways"))
-        elif layer == "vegetation":
-            count = safe_len(data.get("forest")) + safe_len(data.get("other_veg"))
-        elif layer == "buildings":
-            count = safe_len(data.get("buildings"))
-        else:
-            count = 0
-
-        self.right_panel.set_preview_layer_done(layer, count)
-
         if layer == "roads":
             visible = self.param_panel.get_params()["ROAD_LEVELS"]
             self.map_canvas.set_preview_roads(data)
@@ -733,31 +798,21 @@ class MainWindow(QMainWindow):
             self.map_canvas.set_preview_vegetation(data)
         elif layer == "buildings":
             self.map_canvas.set_preview_buildings(data)
-
+        self.right_panel.set_preview_layer_done(layer, self._count_layer(layer))
         self.map_canvas.set_preview_opacity(True)
-
         if tp._overpass_strategy == "sequential" and hasattr(self, '_sequential_pending'):
             self._sequential_pending.discard(layer)
             if not self._sequential_pending and self._sequential_next:
                 for next_layer in self._sequential_next:
                     self._launch_preview_worker(next_layer, self._preview_bbox, self._preview_cache_dir)
                 self._sequential_next = []
-        
         if not any(w.isRunning() for w in self._preview_workers.values()):
             self.right_panel._btn_stop_preview.setVisible(False)
 
     def _on_road_levels_changed(self):
         visible = self.param_panel.get_params()["ROAD_LEVELS"]
         self.map_canvas.update_preview_visibility(visible)
-        
-    def _on_tab_changed(self, index):
-        if self.tabs.widget(index) == self.stl_viewer:
-            if not self.stl_viewer._meshes:
-                self.stl_viewer.reload_stl_folder()
-
-    def _on_overpass_ready(self, strategy):
-        self.map_canvas.setEnabled(True)
-        self._gen_locked = False
+        self.right_panel.set_preview_layer_done("roads", self._count_layer("roads"))
 
     def _on_water_filter_changed(self):
         params = self.param_panel.get_params()
@@ -766,6 +821,7 @@ class MainWindow(QMainWindow):
             min_area_m2=params["MIN_WATER_AREA_M2"],
             min_length_m=params["MIN_WATERWAY_LENGTH_M"]
         )
+        self.right_panel.set_preview_layer_done("water", self._count_layer("water"))
 
     def _on_building_filter_changed(self):
         params = self.param_panel.get_params()
@@ -773,6 +829,16 @@ class MainWindow(QMainWindow):
         self.map_canvas._draw_osm_preview_buildings(
             min_area_m2=params["MIN_BUILDING_AREA_M2"]
         )
+        self.right_panel.set_preview_layer_done("buildings", self._count_layer("buildings"))
+
+    def _on_tab_changed(self, index):
+        if self.tabs.widget(index) == self.stl_viewer:
+            if not self.stl_viewer._meshes:
+                self.stl_viewer.reload_stl_folder()
+
+    def _on_overpass_ready(self, strategy):
+        self.map_canvas.setEnabled(True)
+        self._gen_locked = False
 
     def _on_save_project(self):
         path, _ = QFileDialog.getSaveFileName(self, "Sauvegarder le projet", "", "Projet Topopixel (*.topo)")
@@ -786,16 +852,27 @@ class MainWindow(QMainWindow):
             "shape_params": self.map_canvas._shape_params,
             "params": self.param_panel.get_params(),
             "excluded_ids": list(self.map_canvas._tooltip._excluded_ids),
+            "colors": TOPIC_COLORS.copy(),
+            "gpx_list": self.param_panel.get_gpx_list(),
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
+            
+        project_name = os.path.splitext(os.path.basename(path))[0]
+        self.setWindowTitle(f"Topopixel — {project_name}")
+        self._project_name = project_name
 
     def _on_load_project(self):
+        self.map_canvas.clear_shape()
         path, _ = QFileDialog.getOpenFileName(self, "Charger un projet", "", "Projet Topopixel (*.topo)")
         if not path:
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+            
+        project_name = os.path.splitext(os.path.basename(path))[0]
+        self.setWindowTitle(f"Topopixel — {project_name}")
+        self._project_name = project_name
 
         m = data.get("map", {})
         self.map_canvas.set_center(m.get("lon", 3.26), m.get("lat", 46.92), m.get("zoom", 14))
@@ -804,12 +881,16 @@ class MainWindow(QMainWindow):
         self.map_canvas._shape_params = data.get("shape_params")
         if self.map_canvas._shape_kind:
             self.map_canvas._restore_shape_item()
+            self.right_panel._on_shape_changed()
         
         params = data.get("params", {})
         for key, widget in self.param_panel._fields.items():
             if key in params:
-                if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
-                    widget.setValue(params[key])
+                if isinstance(widget, QSlider):
+                    if hasattr(widget, "scale"):
+                        widget.setValue(int(params[key] * widget.scale))
+                    else:
+                        widget.setValue(params[key])
                 elif isinstance(widget, QLineEdit):
                     widget.setText(params[key])
 
@@ -824,15 +905,172 @@ class MainWindow(QMainWindow):
         excluded = data.get("excluded_ids", [])
         self.map_canvas._tooltip._excluded_ids = {tuple(e) for e in excluded}
 
-        self.map_canvas.shape_changed.emit()
         if self.map_canvas._shape_kind:
             self._on_shape_changed_preview()
+            self.right_panel._gen_button.setVisible(True)
+        else:
+            self.map_canvas.shape_changed.emit()
+            
+        colors = data.get("colors", {})
+        for key, color in colors.items():
+            TOPIC_COLORS[key] = color
+            if key in self.param_panel._color_buttons:
+                from constants import color_button_style, checkbox_style
+                self.param_panel._color_buttons[key].setStyleSheet(color_button_style(color))
+                self.param_panel._layer_checkboxes[key].setStyleSheet(checkbox_style(color))
+        if colors:
+            self.map_canvas.update_preview_colors()
+            for key, color in colors.items():
+                self.stl_viewer.update_layer_color(key, color)
+                
+        self.param_panel.clear_gpx_list()
+        for gpx in data.get("gpx_list", []):
+            self.param_panel._add_gpx_row(gpx["path"], gpx["color"], gpx["enabled"])
+        self.param_panel.gpx_changed.emit()
+
+    def _on_exclusion_changed_count(self, key, excluded):
+        layer_type = key[0]
+        mapping = {"road": "roads", "water": "water", "vegetation": "vegetation", "buildings": "buildings"}
+        layer = mapping.get(layer_type)
+        if layer:
+            self.right_panel.set_preview_layer_done(layer, self._count_layer(layer))
+
+    def _on_color_changed(self, key, color):
+        TOPIC_COLORS[key] = color
+        self.map_canvas.update_preview_colors()
+        self.stl_viewer.update_layer_color(key, color)
+        cb_map = {
+            "roads": self.right_panel._cb_preview_roads,
+            "water": self.right_panel._cb_preview_water,
+            "vegetation": self.right_panel._cb_preview_veg,
+            "buildings": self.right_panel._cb_preview_buildings,
+        }
+        if key in cb_map:
+            cb_map[key].setStyleSheet(checkbox_style(color))
+            
+    def _on_gpx_changed(self):
+        self.map_canvas.set_gpx_tracks(self.param_panel.get_gpx_list())
+
+    def _on_cache_coverage_toggled(self, checked):
+        if not checked:
+            self.map_canvas.clear_cache_coverage()
+            return
+        params = self.param_panel.get_params()
+        resolution_m = int(params.get("RESOLUTION_M", 5))
+        cache_dir = params.get("CACHE_DIR", "cache")
+        bboxes = []
+        if os.path.isdir(cache_dir):
+            for fname in os.listdir(cache_dir):
+                if not fname.endswith(".tif"):
+                    continue
+                parsed = tp._parse_cache_bbox(fname)
+                if parsed is not None and parsed["resolution_m"] == resolution_m:
+                    bboxes.append(parsed)
+        self.map_canvas.show_cache_coverage(bboxes)
 
 def _qt_message_filter(msg_type, context, message):
     
     if "Point size <= 0" in message:
         return
     sys.stderr.write(message + "\n")
+
+DARK_STYLESHEET = """
+QWidget {
+    background: #2B2B2B;
+    color: #DDDDDD;
+}
+QMainWindow, QDialog {
+    background: #2B2B2B;
+}
+QLabel {
+    color: #DDDDDD;
+    background: transparent;
+}
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    background: #3C3C3C;
+    color: #DDDDDD;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 2px 4px;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid #888888;
+}
+QPushButton {
+    background: #3C3C3C;
+    color: #DDDDDD;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 4px 10px;
+}
+QPushButton:hover {
+    background: #4A4A4A;
+}
+QPushButton:pressed {
+    background: #2F2F2F;
+}
+QPushButton:checked {
+    background: #555555;
+    border: 1px solid #888888;
+}
+QSlider::groove:horizontal {
+    background: #444444;
+    height: 4px;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #999999;
+    width: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}
+QScrollArea {
+    background: #2B2B2B;
+    border: none;
+}
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #2B2B2B;
+    width: 12px;
+    height: 12px;
+}
+QScrollBar::handle {
+    background: #555555;
+    border-radius: 5px;
+}
+QTabWidget::pane {
+    border: 1px solid #444444;
+    background: #2B2B2B;
+}
+QTabBar::tab {
+    background: #3C3C3C;
+    color: #DDDDDD;
+    padding: 6px 14px;
+}
+QTabBar::tab:selected {
+    background: #4A4A4A;
+}
+QMenu {
+    background: #3C3C3C;
+    color: #DDDDDD;
+    border: 1px solid #555555;
+}
+QMenu::item:selected {
+    background: #555555;
+}
+QToolButton {
+    background: transparent;
+    color: #DDDDDD;
+}
+QGraphicsView {
+    background: #2B2B2B;
+    border: none;
+}
+QListWidget {
+    background: #3C3C3C;
+    color: #DDDDDD;
+    border: 1px solid #555555;
+}
+"""
 
 def main():
     qInstallMessageHandler(_qt_message_filter)
@@ -842,7 +1080,7 @@ def main():
     )
 
     app = QApplication(sys.argv)
-
+    app.setStyleSheet(DARK_STYLESHEET)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

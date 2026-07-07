@@ -1,12 +1,12 @@
 import os
 import numpy as np
-
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QApplication, QPushButton, QToolButton, QMenu, QWidgetAction
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QMouseEvent, QWheelEvent
-
 import trimesh
-
+import subprocess
+import glob
+from datetime import datetime
 from vtkmodules.vtkRenderingCore import (
     vtkRenderer, vtkRenderWindow, vtkActor, vtkPolyDataMapper
 )
@@ -172,16 +172,27 @@ class StlViewerPanel(QWidget):
 
         self._vtk_widget = VtkOffscreenWidget(self)
         layout.addWidget(self._vtk_widget, stretch=1)
+        
+        self._btn_export_3mf = QPushButton("Ouvrir")
+        self._btn_export_3mf.setVisible(False)
+        self._btn_export_3mf.clicked.connect(self._on_open_3mf)
+        self._checks_layout.addWidget(self._btn_export_3mf)
+        
+        self._lbl_3mf_date = QLabel("")
+        self._lbl_3mf_date.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(self._lbl_3mf_date)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._meshes:
-            from PyQt6.QtWidgets import QApplication
-            main_win = QApplication.activeWindow()
+            main_win = self.window()
             stl_dir = "STL"
             if hasattr(main_win, 'param_panel'):
                 stl_dir = main_win.param_panel.get_params().get("STL_DIR", "STL")
             self.reload_stl_folder(stl_dir)
+            self._btn_export_3mf.setVisible(True)
+        else:
+            self._btn_export_3mf.setVisible(True)
 
     def reload_stl_folder(self, folder="STL"):
         self._meshes.clear()
@@ -206,18 +217,53 @@ class StlViewerPanel(QWidget):
                 self._actors[fname] = actor
             except Exception as e:
                 print(f"[VIEWER] erreur {fname} : {e}")
+                
+        for path in sorted(glob.glob(os.path.join(folder, "terrain_gpx_*.stl"))):
+            fname = os.path.basename(path)
+            try:
+                loaded = trimesh.load(path)
+                if isinstance(loaded, trimesh.Scene):
+                    mesh = trimesh.util.concatenate(list(loaded.geometry.values()))
+                else:
+                    mesh = loaded
+                if len(mesh.faces) == 0:
+                    continue
+                win = self.window()
+                color = "#FF0000"
+                if hasattr(win, 'param_panel'):
+                    gpx_list = win.param_panel.get_gpx_list()
+                    idx = int(fname.replace("terrain_gpx_", "").replace(".stl", ""))
+                    if idx < len(gpx_list):
+                        color = gpx_list[idx].get("color", "#FF0000")
+                actor = trimesh_to_vtk_actor(mesh, color)
+                self._vtk_widget.add_actor(actor)
+                self._meshes[fname] = mesh
+                self._actors[fname] = actor
+            except Exception as e:
+                print(f"[VIEWER] erreur {fname} : {e}")
 
         self._vtk_widget.reset_camera()
         self._vtk_widget.render_to_label()
         self._rebuild_checkboxes()
+        
+        project_name = "topopixel"
+        win = self.window()
+        if hasattr(win, '_project_name'):
+            project_name = win._project_name
+        mf = os.path.join(folder, f"{project_name}.3mf")
+        if os.path.exists(mf):
+            t = datetime.fromtimestamp(os.path.getmtime(mf))
+            self._lbl_3mf_date.setText(f"3MF généré le {t.strftime('%d/%m/%Y %H:%M')}")
+        else:
+            self._lbl_3mf_date.setText("")
 
     def _rebuild_checkboxes(self):
         while self._checks_layout.count():
             item = self._checks_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w and w not in (self._btn_export_3mf,):
+                w.deleteLater()
         self._checkboxes.clear()
-
         for fname, (color_hex, label) in LAYER_COLORS.items():
             if fname not in self._actors:
                 continue
@@ -228,15 +274,60 @@ class StlViewerPanel(QWidget):
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.setStyleSheet(f"""
-                QCheckBox {{ color: rgb({r},{g},{b}); font-weight: bold; background: white; padding: 2px 6px; border-radius: 3px; }}
+                QCheckBox {{ color: rgb({r},{g},{b}); font-weight: bold; background: #3C3C3C; padding: 2px 6px; border-radius: 3px; }}
                 QCheckBox::indicator:checked {{ background: rgb({r},{g},{b}); border: 1px solid rgb({r},{g},{b}); }}
-                QCheckBox::indicator:unchecked {{ background: white; border: 1px solid rgb({r},{g},{b}); }}
+                QCheckBox::indicator:unchecked {{ background: #3C3C3C; border: 1px solid rgb({r},{g},{b}); }}
             """)
             cb.stateChanged.connect(lambda state, f=fname: self._on_toggle(f, state))
             self._checks_layout.addWidget(cb)
             self._checkboxes[fname] = cb
 
+        win = self.window()
+        gpx_list_raw = win.param_panel.get_gpx_list() if hasattr(win, 'param_panel') else []
+        gpx_list = [g for g in gpx_list_raw if g.get("enabled") and g.get("path")]
+
+        gpx_button = QToolButton()
+        gpx_button.setText("GPX")
+        gpx_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        gpx_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        gpx_button.setStyleSheet("""
+            QToolButton {
+                background: white;
+                border: none;
+                padding: 2px 8px;
+                font-weight: bold;
+                color: #333333;
+            }
+        """)
+        gpx_menu = QMenu(gpx_button)
+        has_gpx = False
+
+        for i, gpx in enumerate(gpx_list):
+            fname = f"terrain_gpx_{i}.stl"
+            if fname not in self._actors:
+                continue
+            has_gpx = True
+            color = gpx.get("color", "#FF0000")
+            r, g, b = hex_to_rgb(color)
+            cb = QCheckBox(f"GPX {i+1}")
+            cb.setChecked(True)
+            cb.setStyleSheet(f"""
+                QCheckBox {{ color: rgb({r},{g},{b}); font-weight: bold; padding: 4px 8px; }}
+                QCheckBox::indicator:checked {{ background: rgb({r},{g},{b}); border: 1px solid rgb({r},{g},{b}); }}
+                QCheckBox::indicator:unchecked {{ background: #3C3C3C; border: 1px solid rgb({r},{g},{b}); }}
+            """)
+            cb.stateChanged.connect(lambda state, f=fname: self._on_toggle(f, state))
+            action = QWidgetAction(gpx_menu)
+            action.setDefaultWidget(cb)
+            gpx_menu.addAction(action)
+            self._checkboxes[fname] = cb
+
+        if has_gpx:
+            gpx_button.setMenu(gpx_menu)
+            self._checks_layout.addWidget(gpx_button)
+
         self._checks_layout.addStretch()
+        self._checks_layout.addWidget(self._btn_export_3mf)
 
     def _on_toggle(self, fname, state):
         if fname not in self._actors:
@@ -244,3 +335,30 @@ class StlViewerPanel(QWidget):
         visible = state == Qt.CheckState.Checked.value
         self._actors[fname].SetVisibility(1 if visible else 0)
         self._vtk_widget.render_to_label()
+        
+    def _on_open_3mf(self):
+        stl_dir = getattr(self, '_current_stl_dir', 'STL')
+        win = self.window()
+        project_name = getattr(win, '_project_name', 'topopixel')
+        path = os.path.join(stl_dir, f"{project_name}.3mf")
+        if os.path.exists(path):
+            subprocess.Popen(['explorer', path] if os.name == 'nt' else ['xdg-open', path])
+            self._lbl_3mf_date.setText(f"3MF généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        else:
+            print(f"[3MF] fichier introuvable : {path}")
+            
+    def update_layer_color(self, key, color):
+        fname = f"terrain_{key}.stl"
+        if fname not in self._actors:
+            return
+        r, g, b = hex_to_rgb(color)
+        self._actors[fname].GetProperty().SetColor(r/255, g/255, b/255)
+        self._vtk_widget.render_to_label()
+        LAYER_COLORS[fname] = (color, LAYER_COLORS[fname][1])
+        cb = self._checkboxes.get(fname)
+        if cb:
+            cb.setStyleSheet(f"""
+                QCheckBox {{ color: rgb({r},{g},{b}); font-weight: bold; background: #3C3C3C; padding: 2px 6px; border-radius: 3px; }}
+                QCheckBox::indicator:checked {{ background: rgb({r},{g},{b}); border: 1px solid rgb({r},{g},{b}); }}
+                QCheckBox::indicator:unchecked {{ background: #3C3C3C; border: 1px solid rgb({r},{g},{b}); }}
+            """)

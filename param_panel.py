@@ -1,29 +1,21 @@
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QLineEdit, QScrollArea, QLabel, QGridLayout, QSizePolicy,
-    QToolButton, QFrame, QPushButton
+    QCheckBox, QLineEdit, QScrollArea, QLabel, QSizePolicy,
+    QToolButton, QFrame, QPushButton, QColorDialog, QHBoxLayout, QFileDialog, QSlider, QMenu, QWidgetAction
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 
-from constants import TOPIC_COLORS, checkbox_style
-
+from constants import TOPIC_COLORS, checkbox_style, color_button_style
+import topopixel as tp
 import shutil
 
-ALL_ROAD_LEVELS = [
-    "motorway", "trunk", "primary", "secondary", "tertiary", "residential",
-    "motorway_link", "trunk_link", "primary_link", "secondary_link",
-    "tertiary_link", "residential_link",
-]
+ALL_ROAD_LEVELS = tp.ROAD_LEVELS
+DEFAULT_ROAD_LEVELS_CHECKED = set(tp.ROAD_LEVELS_DRIVABLE)
 
-DEFAULT_ROAD_LEVELS_CHECKED = {
-    "motorway", "trunk", "primary", "secondary", "tertiary", "residential",
-    "motorway_link", "trunk_link", "primary_link", "secondary_link",
-    "tertiary_link", "residential_link",
-}
-
-PANEL_BG = "#F1F3F5"
-TEXT_COLOR = "#212529"
+PANEL_BG = "#2B2B2B"
+TEXT_COLOR = "#DDDDDD"
 
 PANEL_STYLESHEET = f"""
 QWidget#paramPanelContent {{
@@ -38,8 +30,8 @@ QLabel#sectionHint {{
     font-size: 11px;
 }}
 QDoubleSpinBox, QSpinBox, QLineEdit {{
-    background-color: #FFFFFF;
-    border: 1px solid #CED4DA;
+    background-color: #3C3C3C;
+    border: 1px solid #555555;
     border-radius: 5px;
     padding: 4px 6px;
     color: {TEXT_COLOR};
@@ -61,7 +53,7 @@ QCheckBox::indicator {{
     height: 15px;
     border-radius: 4px;
     border: 1.5px solid #ADB5BD;
-    background-color: #FFFFFF;
+    background-color: #3C3C3C;
 }}
 QCheckBox::indicator:checked {{
     background-color: #4C6EF5;
@@ -129,7 +121,7 @@ class CollapsibleSection(QFrame):
         self.body.setObjectName("sectionBody")
         self.body.setStyleSheet(f"""
             QWidget#sectionBody {{
-                background-color: #FFFFFF;
+                background-color: #2B2B2B;
                 border: 2px solid {accent};
                 border-top: none;
                 border-bottom-left-radius: 8px;
@@ -213,6 +205,7 @@ class ParamPanel(QWidget):
         layout.addWidget(self._build_water_group())
         layout.addWidget(self._build_vegetation_group())
         layout.addWidget(self._build_buildings_group())
+        layout.addWidget(self._build_gpx_group())
         layout.addWidget(self._build_advanced_group())
 
         layout.addStretch(1)
@@ -220,12 +213,16 @@ class ParamPanel(QWidget):
     road_levels_changed = pyqtSignal()
     water_filter_changed = pyqtSignal()
     building_filter_changed = pyqtSignal()
+    color_changed = pyqtSignal(str, str)
+    gpx_changed = pyqtSignal()
+    cache_coverage_toggled = pyqtSignal(bool)
 
     def _build_general_group(self):
         section = CollapsibleSection("Général", accent="#9C36B5")
         form = section.form()
 
-        self._add_int(form, "RESOLUTION_M", "Résolution DEM (m/px)", 1, 1, 30)
+        self._add_int(form, "RESOLUTION_M", "Résolution DEM (m/px)", 5, 1, 30)
+        self._fields["RESOLUTION_M"].valueChanged.connect(lambda: self.cache_coverage_toggled.emit(self._btn_cache_coverage.isChecked()))
         self._add_int(form, "SIZE_MM", "Taille impression (mm)", 120, 10, 500, 1)
         self._add_int(form, "BASE_THICKNESS", "Épaisseur socle", 20, 1, 200, 1)
         
@@ -240,32 +237,110 @@ class ParamPanel(QWidget):
             ("vegetation", "Végétation"),
             ("trees",      "Arbres"),
             ("buildings",  "Bâtiments"),
+            ("gpx", "Tracés GPX"),
         ]
+        self._color_buttons = {}
         for key, label in layers:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.setStyleSheet(checkbox_style(TOPIC_COLORS.get(key, "#888888")))
             self._layer_checkboxes[key] = cb
-            form.addRow(cb)
+            btn = QPushButton()
+            btn.setStyleSheet(color_button_style(TOPIC_COLORS.get(key, "#888888")))
+            btn.clicked.connect(lambda _, k=key, b=btn, c=cb: self._on_pick_color(k, b, c))
+            self._color_buttons[key] = btn
+            row_layout.addWidget(cb)
+            row_layout.addWidget(btn)
+            row_layout.addStretch()
+            form.addRow(row)
 
         return section
 
     def _build_roads_group(self):
         section = CollapsibleSection("Routes", accent="#000000", expanded=False)
 
-        lbl = QLabel("Types de voies à modéliser :")
-        section.add_widget(lbl)
-
-        grid = QGridLayout()
-        grid.setColumnStretch(0, 1)
         self._road_checkboxes = {}
-        for i, level in enumerate(ALL_ROAD_LEVELS):
+
+        drivable_button = QToolButton()
+        drivable_button.setText("Voies carrossables")
+        drivable_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        drivable_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        drivable_button.setStyleSheet("""
+            QToolButton {
+                background: #3C3C3C;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px 22px 4px 10px;
+                color: #DDDDDD;
+            }
+            QToolButton:hover { border: 1px solid #888888; }
+            QToolButton::menu-indicator {
+                subcontrol-position: right center;
+                subcontrol-origin: padding;
+                right: 6px;
+            }
+        """)
+        drivable_menu = QMenu(drivable_button)
+        drivable_menu.setStyleSheet("""
+            QMenu {
+                background: #3C3C3C;
+                border: 1px solid #555555;
+            }
+        """)
+        for level in tp.ROAD_LEVELS_DRIVABLE:
             cb = QCheckBox(level)
             cb.setChecked(level in DEFAULT_ROAD_LEVELS_CHECKED)
-            self._road_checkboxes[level] = cb
+            cb.setStyleSheet("QCheckBox { color: #DDDDDD; padding: 6px 10px; }")
             cb.stateChanged.connect(lambda: self.road_levels_changed.emit())
-            grid.addWidget(cb, i, 0)
-        section.add_layout(grid)
+            self._road_checkboxes[level] = cb
+            action = QWidgetAction(drivable_menu)
+            action.setDefaultWidget(cb)
+            drivable_menu.addAction(action)
+        drivable_button.setMenu(drivable_menu)
+        section.add_widget(drivable_button)
+
+        non_drivable_button = QToolButton()
+        non_drivable_button.setText("Chemins et sentiers")
+        non_drivable_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        non_drivable_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        non_drivable_button.setStyleSheet("""
+            QToolButton {
+                background: #3C3C3C;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px 22px 4px 10px;
+                color: #DDDDDD;
+            }
+            QToolButton:hover { border: 1px solid #888888; }
+            QToolButton::menu-indicator {
+                subcontrol-position: right center;
+                subcontrol-origin: padding;
+                right: 6px;
+            }
+        """)
+        non_drivable_menu = QMenu(non_drivable_button)
+        non_drivable_menu.setStyleSheet("""
+            QMenu {
+                background: #3C3C3C;
+                border: 1px solid #555555;
+            }
+        """)
+
+        for level in tp.ROAD_LEVELS_NON_DRIVABLE:
+            cb = QCheckBox(level)
+            cb.setChecked(level in DEFAULT_ROAD_LEVELS_CHECKED)
+            cb.setStyleSheet("QCheckBox { color: #DDDDDD; padding: 6px 10px; }")
+            cb.stateChanged.connect(lambda: self.road_levels_changed.emit())
+            self._road_checkboxes[level] = cb
+            action = QWidgetAction(non_drivable_menu)
+            action.setDefaultWidget(cb)
+            non_drivable_menu.addAction(action)
+        non_drivable_button.setMenu(non_drivable_menu)
+        section.add_widget(non_drivable_button)
 
         form = section.form()
         self._add_int(form, "ROAD_WIDTH_PX", "Largeur route (px)", 1, 1, 20, 1)
@@ -292,8 +367,8 @@ class ParamPanel(QWidget):
         form = section.form()
 
         self._add_int(form, "TREE_HEIGHT", "Hauteur arbre", 3, 1, 50, 1)
-        self._add_double(form, "TREE_RADIUS", "Rayon base arbre", 1.5, 0.1, 20, 0.1)
-        self._add_double(form, "TREE_DENSITY", "Densité arbres (par px²)", 0.008, 0.0, 1.0, 0.001)
+        self._add_int(form, "TREE_RADIUS", "Rayon base arbre", 1, 1, 20, 1)
+        self._add_int(form, "TREE_DENSITY", "Densité arbres (‰ par px²)", 8, 0, 500, 1)
 
         return section
 
@@ -309,6 +384,25 @@ class ParamPanel(QWidget):
         self._add_int(form, "BUILDING_MAX_HEIGHT", "Hauteur max (modèle)", 20, 0, 200, 1)
         
         self._fields["MIN_BUILDING_AREA_M2"].valueChanged.connect(lambda: self.building_filter_changed.emit())
+
+        return section
+
+    def _build_gpx_group(self):
+        section = CollapsibleSection("Tracés GPX", accent="#C2163A", expanded=False)
+
+        self._gpx_list_layout = QVBoxLayout()
+        self._gpx_list_layout.setSpacing(4)
+        self._gpx_entries = []
+
+        section.add_layout(self._gpx_list_layout)
+
+        btn_add = QPushButton("+ Ajouter des tracés GPX")
+        btn_add.clicked.connect(self._on_add_gpx)
+        section.add_widget(btn_add)
+
+        form = section.form()
+        self._add_int(form, "GPX_WIDTH_PX", "Largeur tracé (px)", 2, 1, 20, 1)
+        self._add_int(form, "GPX_HEIGHT", "Hauteur au-dessus", 4, 0, 50, 1)
 
         return section
 
@@ -337,31 +431,54 @@ class ParamPanel(QWidget):
         form.addRow(self._btn_clear_cache)
         self._update_cache_size()
 
+        self._btn_cache_coverage = QPushButton("Afficher couverture cache DEM")
+        self._btn_cache_coverage.setCheckable(True)
+        self._btn_cache_coverage.setChecked(False)
+        self._btn_cache_coverage.toggled.connect(self.cache_coverage_toggled.emit)
+        form.addRow(self._btn_cache_coverage)
+
         return section
 
     def _add_double(self, form, key, label, default, lo, hi, step):
-        spin = QDoubleSpinBox()
-        spin.setRange(lo, hi)
-        spin.setSingleStep(step)
-        spin.setDecimals(4 if step < 0.01 else (3 if step < 1 else 1))
-        spin.setValue(default)
-        self._fields[key] = spin
-        form.addRow(label, spin)
+        decimals = 4 if step < 0.01 else (3 if step < 1 else 1)
+        scale = 10 ** decimals
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(lo * scale), int(hi * scale))
+        slider.setSingleStep(max(1, int(step * scale)))
+        slider.setValue(int(default * scale))
+        value_lbl = QLabel(f"{default:.{decimals}f}")
+        value_lbl.setMinimumWidth(50)
+        row = QHBoxLayout()
+        row.addWidget(slider)
+        row.addWidget(value_lbl)
+        slider.valueChanged.connect(lambda v: value_lbl.setText(f"{v / scale:.{decimals}f}"))
+        slider.decimals = decimals
+        slider.scale = scale
+        self._fields[key] = slider
+        form.addRow(label, row)
 
     def _add_int(self, form, key, label, default, lo, hi, step=1):
-        spin = QSpinBox()
-        spin.setStyleSheet("QSpinBox::up-button, QSpinBox::down-button { width: 20px; }")
-        spin.setRange(lo, hi)
-        spin.setSingleStep(step)
-        spin.setValue(default)
-        self._fields[key] = spin
-        form.addRow(label, spin)
-
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setSingleStep(step)
+        slider.setValue(default)
+        value_lbl = QLabel(str(default))
+        value_lbl.setMinimumWidth(50)
+        row = QHBoxLayout()
+        row.addWidget(slider)
+        row.addWidget(value_lbl)
+        slider.valueChanged.connect(lambda v: value_lbl.setText(str(v)))
+        self._fields[key] = slider
+        form.addRow(label, row)
+        
     def get_params(self):
         result = {}
         for key, widget in self._fields.items():
-            if isinstance(widget, (QDoubleSpinBox, QSpinBox)):
-                result[key] = widget.value()
+            if isinstance(widget, QSlider):
+                if hasattr(widget, "scale"):
+                    result[key] = widget.value() / widget.scale
+                else:
+                    result[key] = widget.value()
             elif isinstance(widget, QLineEdit):
                 result[key] = widget.text()
 
@@ -398,3 +515,89 @@ class ParamPanel(QWidget):
             shutil.rmtree(cache_dir)
             os.makedirs(cache_dir)
         self._update_cache_size()
+        
+    def _on_pick_color(self, key, btn, cb):
+        dialog = QColorDialog(QColor(TOPIC_COLORS.get(key, "#888888")), self)
+        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if not dialog.exec():
+            return
+        color = dialog.selectedColor()
+        if not color.isValid():
+            return
+        TOPIC_COLORS[key] = color.name()
+        btn.setStyleSheet(color_button_style(color.name()))
+        cb.setStyleSheet(checkbox_style(color.name()))
+        self.color_changed.emit(key, color.name())
+        
+    def _on_add_gpx(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Charger un tracé GPX", "", "GPX (*.gpx)")
+        if not paths:
+            return
+        for path in paths:
+            self._add_gpx_row(path, "#FF0000", True)
+        self.gpx_changed.emit()
+
+    def _add_gpx_row(self, path, color, enabled):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        cb = QCheckBox()
+        cb.setChecked(enabled)
+        cb.setStyleSheet(checkbox_style(color))
+        cb.stateChanged.connect(lambda _: self.gpx_changed.emit())
+
+        path_lbl = QLabel(os.path.basename(path))
+        path_lbl.setToolTip(path)
+        path_lbl.setProperty("full_path", path)
+        path_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        path_lbl.setMinimumWidth(0)
+
+        btn_color = QPushButton()
+        btn_color.setFixedSize(20, 20)
+        btn_color.setStyleSheet(color_button_style(color))
+        btn_color.setProperty("color", color)
+        btn_color.clicked.connect(lambda _, b=btn_color: self._on_gpx_color(b))
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedSize(20, 20)
+        btn_del.clicked.connect(lambda _, r=row: self._on_remove_gpx(r))
+
+        layout.addWidget(cb)
+        layout.addWidget(path_lbl, stretch=1)
+        layout.addWidget(btn_color)
+        layout.addWidget(btn_del)
+
+        self._gpx_list_layout.addWidget(row)
+        self._gpx_entries.append((row, cb, path_lbl, btn_color))
+
+    def _on_gpx_color(self, btn):
+        dialog = QColorDialog(QColor(btn.property("color")), self)
+        dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if not dialog.exec():
+            return
+        color = dialog.selectedColor().name()
+        btn.setProperty("color", color)
+        btn.setStyleSheet(color_button_style(color))
+        self.gpx_changed.emit()
+
+    def _on_remove_gpx(self, row):
+        self._gpx_entries = [(r, cb, lbl, btn) for r, cb, lbl, btn in self._gpx_entries if r != row]
+        row.deleteLater()
+        self.gpx_changed.emit()
+
+    def get_gpx_list(self):
+        result = []
+        for row, cb, lbl, btn_color in self._gpx_entries:
+            result.append({
+                "path": lbl.toolTip(),
+                "color": btn_color.property("color"),
+                "enabled": cb.isChecked(),
+            })
+        return result
+
+    def clear_gpx_list(self):
+        for row, cb, lbl, btn in self._gpx_entries:
+            row.deleteLater()
+        self._gpx_entries = []

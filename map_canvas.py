@@ -1,17 +1,19 @@
 import math
 import json
-
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QLabel, QPushButton, QGraphicsLineItem, QGraphicsPolygonItem, QApplication, QLineEdit, QGraphicsProxyWidget, QSpinBox
+import os
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QLabel, QPushButton, QGraphicsLineItem, QGraphicsPolygonItem, QApplication, QLineEdit, QGraphicsProxyWidget, QSpinBox, QListWidget, QListWidgetItem
 from PyQt6.QtCore import Qt, QRectF, QPointF, QPoint, pyqtSignal, QTimer, QUrl, QUrlQuery
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtGui import (
     QPainter, QPixmap, QPen, QBrush, QColor, QPolygonF, QWheelEvent,
     QMouseEvent
 )
-
 from shapely.geometry import Polygon
-
+import geopandas as gpd
 from tile_manager import TileManager, TILE_SIZE, lonlat_to_tile, tile_to_lonlat
+import xml.etree.ElementTree as ET
+
+from constants import TOPIC_COLORS
 
 MIN_ZOOM = 2
 MAX_ZOOM = 19
@@ -35,13 +37,13 @@ class MapTooltip(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         self._title = QLabel()
-        self._title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self._title.setStyleSheet("font-weight: bold; font-size: 13px; color: #DDDDDD;")
         self._detail = QLabel()
-        self._detail.setStyleSheet("color: #555; font-size: 11px;")
+        self._detail.setStyleSheet("color: #999999; font-size: 11px;")
         self._exclude_btn = QPushButton("Exclure de la génération")
         self._exclude_btn.setCheckable(True)
         self._exclude_btn.setStyleSheet("""
-            QPushButton { background: #f1f3f5; border: 1px solid #ccc; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QPushButton { background: #4A4A4A; color: #DDDDDD; border: 1px solid #666666; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
             QPushButton:checked { background: #FF4444; color: white; border: 1px solid #FF4444; }
         """)
         layout.addWidget(self._title)
@@ -60,7 +62,7 @@ class MapTooltip(QWidget):
         self._exclude_btn.blockSignals(False)
         self.setStyleSheet(f"""
             QWidget {{
-                background: white;
+                background: #000000;
                 border: 2px solid {color};
                 border-radius: 4px;
             }}
@@ -132,32 +134,74 @@ class MapCanvas(QGraphicsView):
         self._search_bar.setFixedHeight(36)
         self._search_bar.setStyleSheet("""
             QLineEdit {
-                background: white;
+                background: #3C3C3C;
                 border: none;
                 border-radius: 18px;
                 padding: 0 16px;
                 font-size: 13px;
-                color: #212529;
+                color: #DDDDDD;
             }
             QLineEdit:focus {
                 border: 2px solid #4C6EF5;
             }
         """)
-        self._search_bar.returnPressed.connect(self._on_search)
+        self._search_bar.returnPressed.connect(self._on_suggestion_enter)
+        self._search_bar.focusOutEvent = self._on_search_focus_out
         self._search_nam = QNetworkAccessManager(self)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         
+        self._search_suggestions = QListWidget(self)
+        self._search_suggestions.setVisible(False)
+        self._search_suggestions.setStyleSheet("""
+            QListWidget {
+                background: #3C3C3C;
+                border: none;
+                border-radius: 12px;
+                font-size: 10px;
+                color: #DDDDDD;
+                padding: 4px 0;
+            }
+            QListWidget::item {
+                padding: 8px 16px;
+                border-radius: 8px;
+            }
+            QListWidget::item:hover {
+                background: #4A4A4A;
+            }
+            QListWidget::item:selected {
+                background: #555555;
+                color: #1971C2;
+            }
+        """)
+        self._search_suggestions.itemClicked.connect(self._on_suggestion_clicked)
+        self._search_results = []
+        self._search_timer.timeout.connect(self._on_search)
+        self._search_bar.textChanged.connect(self._on_search_text_changed)
+
         self._polygon_points = []
         self._draw_shape_item = None
         
         self._osm_preview_items = {}
         self._osm_preview_edges = {}
         
+        self._hovered_vertex = None
+        self._vertex_items = []
+        self.setMouseTracking(True)
+        
+        self._dragging_vertex = None
+        self._drag_vertex_index = None
+        
+        self._gpx_items = []
+        
         self._tooltip = MapTooltip()
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
         
         self._tooltip.exclusion_changed.connect(self._on_exclusion_changed)
+        
+        self._vertex_drag_timer = QTimer(self)
+        self._vertex_drag_timer.setSingleShot(True)
+        self._vertex_drag_timer.timeout.connect(self.shape_changed.emit)
         
     def _on_exclusion_changed(self, key, excluded):
         layer_type, osm_id = key
@@ -268,11 +312,11 @@ class MapCanvas(QGraphicsView):
         item.setPos(scene_x, scene_y)
         item.setScale(ref_scale)
         if getattr(self, '_osm_preview_items', {}):
-            item.setOpacity(0.4)
+            item.setOpacity(0.9)
         self._tile_items[key] = item
 
     def set_preview_opacity(self, has_preview: bool):
-        opacity = 0.4 if has_preview else 1.0
+        opacity = 0.9 if has_preview else 1.0
         for item in self._tile_items.values():
             item.setOpacity(opacity)
 
@@ -282,6 +326,17 @@ class MapCanvas(QGraphicsView):
     
         if self._draw_tool is not None:
             self._draw_mouse_press(event)
+            return
+            
+        if event.button() == Qt.MouseButton.LeftButton and self._hovered_vertex is not None:
+            self._vertex_drag_timer.stop()
+            self._dragging_vertex = self._hovered_vertex
+            if self._hovered_vertex not in self._vertex_items:
+                self._hovered_vertex = None
+                event.accept()
+                return
+            self._drag_vertex_index = self._vertex_items.index(self._hovered_vertex)
+            event.accept()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -306,6 +361,47 @@ class MapCanvas(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+    
+        if self._draw_tool is None and self._vertex_items:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            tolerance = 8 / self._zoom_scale_factor()
+            hovered = None
+            for item in self._vertex_items:
+                data = item.data(0)
+                pt = self._lonlat_to_scene(data["lon"], data["lat"])
+                if abs(pt.x() - scene_pos.x()) < tolerance and abs(pt.y() - scene_pos.y()) < tolerance:
+                    hovered = item
+                    break
+            if hovered != self._hovered_vertex:
+                self._hovered_vertex = hovered
+                if hovered:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+    
+        if self._dragging_vertex is not None:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            lon, lat = self._scene_to_lonlat(scene_pos)
+            idx = self._drag_vertex_index
+            if self._shape_kind == "rect":
+                p = self._shape_params
+                corners = ["west_north", "east_north", "east_south", "west_south"]
+                corner = corners[idx]
+                if "west" in corner:
+                    p["west"] = lon
+                if "east" in corner:
+                    p["east"] = lon
+                if "north" in corner:
+                    p["north"] = lat
+                if "south" in corner:
+                    p["south"] = lat
+            elif self._shape_kind == "polygon":
+                self._shape_params["points"][idx] = [lon, lat]
+            self._redraw_shape()
+            self._draw_vertices()
+            event.accept()
+            return
+    
         if self._draw_tool is not None:
             self._draw_mouse_move(event)
             return
@@ -331,6 +427,27 @@ class MapCanvas(QGraphicsView):
         if self._draw_tool is not None:
             self._draw_mouse_release(event)
             return
+            
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging_vertex is not None:
+            self._dragging_vertex = None
+            self._drag_vertex_index = None
+            self._vertex_drag_timer.start(1000)
+            p = self._shape_params
+            kind = self._shape_kind
+            if kind == "rect":
+                lat_mid = (p["north"] + p["south"]) / 2
+                p["width"] = abs(p["east"] - p["west"]) * 111320 * math.cos(math.radians(lat_mid))
+                p["height"] = abs(p["north"] - p["south"]) * 111320
+                p["area"] = p["width"] * p["height"] / 10000
+            elif kind == "polygon":
+                poly = Polygon([(lon, lat) for lon, lat in p["points"]])
+                gdf = gpd.GeoDataFrame(geometry=[poly], crs="EPSG:4326").to_crs("EPSG:3857")
+                p["area"] = gdf.geometry.area.iloc[0] / 10000
+                
+            self._on_shape_changed_internal()
+            event.accept()
+            return
+            
         if event.button() == Qt.MouseButton.LeftButton:
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -389,6 +506,11 @@ class MapCanvas(QGraphicsView):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_tiles()
+        w = min(400, self.width() - 40)
+        self._search_bar.setFixedWidth(w)
+        self._search_bar.move((self.width() - w) // 2, 12)
+        self._search_suggestions.setFixedWidth(w)
+        self._search_suggestions.move((self.width() - w) // 2, 12 + 36 + 4)
 
     def set_draw_tool(self, tool):
         self._draw_tool = tool
@@ -401,6 +523,12 @@ class MapCanvas(QGraphicsView):
         if self._current_shape_item is not None:
             self._scene.removeItem(self._current_shape_item)
             self._current_shape_item = None
+            
+            for item in self._vertex_items:
+                self._scene.removeItem(item)
+            self._vertex_items.clear()
+            self._hovered_vertex = None
+            
         self._shape_kind = None
         self._shape_params = None
         self.shape_changed.emit()
@@ -557,40 +685,27 @@ class MapCanvas(QGraphicsView):
         elif self._draw_tool == "polygon":
             if len(self._polygon_points) < 3:
                 return
-
             poly = QPolygonF(self._polygon_points)
-            
-            area = 0
-            n = len(self._polygon_points)
-            for i in range(n):
-                x1, y1 = self._polygon_points[i].x(), self._polygon_points[i].y()
-                x2, y2 = self._polygon_points[(i + 1) % n].x(), self._polygon_points[(i + 1) % n].y()
-                area += x1 * y2 - x2 * y1
-
+            lonlat_points = [self._scene_to_lonlat(p) for p in self._polygon_points]
+            gdf = gpd.GeoDataFrame(geometry=[Polygon(lonlat_points)], crs="EPSG:4326").to_crs("EPSG:3857")
             self._shape_kind = "polygon"
             self._shape_params = {
-                "area": abs(area)/20000*(m_per_unit**2),
-                "points": [
-                    self._scene_to_lonlat(p) for p in self._polygon_points
-                ]
+                "area": gdf.geometry.area.iloc[0] / 10000,
+                "points": [[lon, lat] for lon, lat in lonlat_points]
             }
-
             pen = QPen(QColor(0, 150, 60), 2 / self._zoom_scale_factor())
             brush = QBrush(QColor(0, 150, 60, 60))
-
             if self._current_shape_item is not None:
                 self._scene.removeItem(self._current_shape_item)
-
             self._current_shape_item = self._scene.addPolygon(poly, pen, brush)
-
             self._polygon_points.clear()
 
         self.set_draw_tool(None)
         self.shape_changed.emit()
+        self._draw_vertices()
 
     def set_preview_roads(self, edges_by_level: dict):
         self._clear_osm_preview("roads")
-        self._osm_preview_edges["roads"] = edges_by_level
         shape = self._shape_as_shapely()
         if shape is not None and edges_by_level:
             clipped = {}
@@ -598,10 +713,15 @@ class MapCanvas(QGraphicsView):
                 filtered = edges[edges.geometry.intersects(shape)]
                 if not filtered.empty:
                     clipped[level] = filtered
-            self._draw_osm_preview_roads(list(clipped.keys()))
             self._osm_preview_edges["roads"] = clipped
         else:
-            self._draw_osm_preview_roads(list(edges_by_level.keys()))
+            self._osm_preview_edges["roads"] = edges_by_level
+        from PyQt6.QtWidgets import QApplication
+        win = QApplication.activeWindow()
+        visible = list(self._osm_preview_edges["roads"].keys())
+        if hasattr(win, 'param_panel'):
+            visible = [l for l in win.param_panel.get_params().get("ROAD_LEVELS", []) if l in self._osm_preview_edges["roads"]]
+        self._draw_osm_preview_roads(visible)
 
     def set_preview_water(self, data: dict):
         self._clear_osm_preview("water")
@@ -617,7 +737,14 @@ class MapCanvas(QGraphicsView):
             self._osm_preview_edges["water"] = clipped
         else:
             self._osm_preview_edges["water"] = data
-        self._draw_osm_preview_water()
+        from PyQt6.QtWidgets import QApplication
+        win = QApplication.activeWindow()
+        min_area, min_length = 0, 0
+        if hasattr(win, 'param_panel'):
+            params = win.param_panel.get_params()
+            min_area = params.get("MIN_WATER_AREA_M2", 0)
+            min_length = params.get("MIN_WATERWAY_LENGTH_M", 0)
+        self._draw_osm_preview_water(min_area_m2=min_area, min_length_m=min_length)
 
     def set_preview_vegetation(self, data: dict):
         self._clear_osm_preview("vegetation")
@@ -647,7 +774,12 @@ class MapCanvas(QGraphicsView):
                 self._osm_preview_edges["buildings"] = data
         else:
             self._osm_preview_edges["buildings"] = data
-        self._draw_osm_preview_buildings()
+        from PyQt6.QtWidgets import QApplication
+        win = QApplication.activeWindow()
+        min_area = 0
+        if hasattr(win, 'param_panel'):
+            min_area = win.param_panel.get_params().get("MIN_BUILDING_AREA_M2", 0)
+        self._draw_osm_preview_buildings(min_area_m2=min_area)
 
     def update_preview_visibility(self, visible_levels: list):
         self._clear_osm_preview("roads")
@@ -673,6 +805,26 @@ class MapCanvas(QGraphicsView):
         for layer in list(self._osm_preview_items.keys()):
             self._clear_osm_preview(layer)
         self._osm_preview_edges.clear()
+
+    def show_cache_coverage(self, bboxes):
+        self.clear_cache_coverage()
+        pen = QPen(QColor(70, 130, 180, 200))
+        pen.setWidth(2)
+        brush = QBrush(QColor(70, 130, 180, 60))
+        items = []
+        for bbox in bboxes:
+            top_left = self._lonlat_to_scene(bbox["west"], bbox["north"])
+            bottom_right = self._lonlat_to_scene(bbox["east"], bbox["south"])
+            rect = QRectF(top_left, bottom_right)
+            item = self._scene.addRect(rect, pen, brush)
+            item.setZValue(5)
+            items.append(item)
+        self._cache_coverage_items = items
+
+    def clear_cache_coverage(self):
+        for item in getattr(self, "_cache_coverage_items", []):
+            self._scene.removeItem(item)
+        self._cache_coverage_items = []
 
     def _clear_osm_preview(self, layer: str):
         for item in self._osm_preview_items.get(layer, []):
@@ -702,6 +854,10 @@ class MapCanvas(QGraphicsView):
                     item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), pen)
                     item.setZValue(6)
                     item.setData(0, {"type": "road", "osm_id": osm_id, "name": name, "subtype": level})
+                    if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "road"}:
+                        pen = item.pen()
+                        pen.setColor(QColor("#FF4444"))
+                        item.setPen(pen)
                     items.append(item)
         self._osm_preview_items["roads"] = items
 
@@ -740,6 +896,10 @@ class MapCanvas(QGraphicsView):
                     item = self._scene.addPolygon(poly, pen, brush)
                     item.setZValue(5)
                     item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_m2} m²"})
+                    if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "water"}:
+                        color = QColor("#FF4444")
+                        color.setAlphaF(0.7)
+                        item.setBrush(QBrush(color))
                     items.append(item)
 
         if waterways is not None:
@@ -775,6 +935,10 @@ class MapCanvas(QGraphicsView):
                     item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), line_pen)
                     item.setZValue(5)
                     item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{length_m} m"})
+                    if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "water"}:
+                        pen = item.pen()
+                        pen.setColor(QColor("#FF4444"))
+                        item.setPen(pen)
                     items.append(item)
 
         self._osm_preview_items["water"] = items
@@ -799,7 +963,7 @@ class MapCanvas(QGraphicsView):
                 osm_id = idx[1] if isinstance(idx, tuple) else idx
                 name = row.get("name", "") or ""
                 subtype = row.get("natural", "") or row.get("landuse", "") or row.get("leisure", "") or ""
-                area_m2 = round(dataset_proj.loc[idx].geometry.area)
+                area_ha = round(dataset_proj.loc[idx].geometry.area)/10000
                 parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
                 for part in parts:
                     poly = QPolygonF()
@@ -808,7 +972,11 @@ class MapCanvas(QGraphicsView):
                         poly.append(p)
                     item = self._scene.addPolygon(poly, pen, brush)
                     item.setZValue(5)
-                    item.setData(0, {"type": "vegetation", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_m2} m²"})
+                    item.setData(0, {"type": "vegetation", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} ha"})
+                    if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "vegetation"}:
+                        color = QColor("#FF4444")
+                        color.setAlphaF(0.7)
+                        item.setBrush(QBrush(color))
                     items.append(item)
         self._osm_preview_items["vegetation"] = items
     
@@ -837,7 +1005,7 @@ class MapCanvas(QGraphicsView):
             osm_id = idx[1] if isinstance(idx, tuple) else idx
             name = row.get("name", "") or ""
             subtype = row.get("building", "") or ""
-            area_ha = round(buildings_proj.loc[idx].geometry.area)/10000
+            area_ha = round(buildings_proj.loc[idx].geometry.area)
             parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
             for part in parts:
                 poly = QPolygonF()
@@ -846,7 +1014,11 @@ class MapCanvas(QGraphicsView):
                     poly.append(p)
                 item = self._scene.addPolygon(poly, pen, brush)
                 item.setZValue(5)
-                item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} ha"})
+                item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} m²"})
+                if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "buildings"}:
+                    color = QColor("#FF4444")
+                    color.setAlphaF(0.7)
+                    item.setBrush(QBrush(color))
                 items.append(item)
         self._osm_preview_items["buildings"] = items
 
@@ -883,28 +1055,14 @@ class MapCanvas(QGraphicsView):
         params = QUrlQuery()
         params.addQueryItem("q", query)
         params.addQueryItem("format", "json")
-        params.addQueryItem("limit", "1")
+        params.addQueryItem("limit", "3")
         url.setQuery(params)
         req = QNetworkRequest(url)
         req.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, "topopixel/1.0")
         reply = self._search_nam.get(req)
         reply.finished.connect(lambda: self._on_search_result(reply))
 
-    def _on_search_result(self, reply):
-        if reply.error() != QNetworkReply.NetworkError.NoError:
-            reply.deleteLater()
-            return
-        data = json.loads(bytes(reply.readAll()))
-        reply.deleteLater()
-        if not data:
-            return
-        lat = float(data[0]["lat"])
-        lon = float(data[0]["lon"])
-        self.set_center(lon, lat, 14)
-        self._search_bar.clearFocus()
-
     def _restore_shape_item(self):
-        import math
         if self._shape_kind is None or self._shape_params is None:
             return
         pen = QPen(QColor(0, 150, 60), 2 / self._zoom_scale_factor())
@@ -929,10 +1087,170 @@ class MapCanvas(QGraphicsView):
         elif self._shape_kind == "polygon":
             pts = [self._lonlat_to_scene(lon, lat) for lon, lat in p["points"]]
             self._current_shape_item = self._scene.addPolygon(QPolygonF(pts), pen, brush)
+            
+        self._draw_vertices()
+
+    def _on_search_text_changed(self, text):
+        if len(text) < 3:
+            self._search_suggestions.setVisible(False)
+            return
+        self._search_timer.start(300)
+
+    def _on_search_result(self, reply):
+        self._search_suggestions.setVisible(True)
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            reply.deleteLater()
+            return
+        raw = bytes(reply.readAll())
+        self._search_results = json.loads(raw)
+        reply.deleteLater()
+        self._search_suggestions.clear()
+        if not self._search_results:
+            self._search_suggestions.setVisible(False)
+            return
+        for r in self._search_results:
+            self._search_suggestions.addItem(r.get("display_name", ""))
+        self._search_suggestions.setFixedHeight(len(self._search_results) * 50)
+        self._search_suggestions.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._search_suggestions.setVisible(True)
+        self._search_suggestions.raise_()
+
+    def _on_suggestion_clicked(self, item):
+        idx = self._search_suggestions.row(item)
+        r = self._search_results[idx]
+        self._search_bar.setText(r.get("display_name", ""))
+        self._search_suggestions.setVisible(False)
+        self.set_center(float(r["lon"]), float(r["lat"]), 14)
+        self._search_bar.clearFocus()
+        self._search_timer.stop()
+
+    def _on_suggestion_enter(self):
+        if self._search_results:
+            r = self._search_results[0]
+            self._search_bar.setText(r.get("display_name", ""))
+            self._search_suggestions.setVisible(False)
+            self.set_center(float(r["lon"]), float(r["lat"]), 14)
+            self._search_bar.clearFocus()
+            elf._search_timer.stop()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_tiles()
         w = min(400, self.width() - 40)
         self._search_bar.setFixedWidth(w)
+        self._search_suggestions.setFixedWidth(w)
         self._search_bar.move((self.width() - w) // 2, 12)
+        self._search_suggestions.move((self.width() - w) // 2, 12 + 36 + 4)
+        
+    def _on_search_focus_out(self, event):
+        self._search_suggestions.setVisible(False)
+        
+    def update_preview_colors(self):
+        PREVIEW_COLORS["roads"] = TOPIC_COLORS.get("roads", "#000000")
+        PREVIEW_COLORS["water"] = TOPIC_COLORS.get("water", "#0094FF")
+        PREVIEW_COLORS["vegetation"] = TOPIC_COLORS.get("vegetation", "#00D921")
+        PREVIEW_COLORS["buildings"] = TOPIC_COLORS.get("buildings", "#898989")
+        for layer in ("roads", "water", "vegetation", "buildings"):
+            if layer in self._osm_preview_edges:
+                self._clear_osm_preview(layer)
+                if layer == "roads":
+                    self._draw_osm_preview_roads(list(self._osm_preview_edges["roads"].keys()))
+                elif layer == "water":
+                    self._draw_osm_preview_water()
+                elif layer == "vegetation":
+                    self._draw_osm_preview_vegetation()
+                elif layer == "buildings":
+                    self._draw_osm_preview_buildings()
+                    
+    def _draw_vertices(self):
+        for item in self._vertex_items:
+            self._scene.removeItem(item)
+        self._vertex_items = []
+        if self._shape_kind is None:
+            return
+        pen = QPen(QColor(0, 150, 60))
+        brush = QBrush(QColor(0, 150, 60))
+        r = 6 / self._zoom_scale_factor()
+        p = self._shape_params
+        if self._shape_kind == "rect":
+            corners = [
+                (p["west"], p["north"]),
+                (p["east"], p["north"]),
+                (p["east"], p["south"]),
+                (p["west"], p["south"]),
+            ]
+        elif self._shape_kind == "polygon":
+            corners = p["points"]
+        else:
+            corners = []
+        for lon, lat in corners:
+            scene_pt = self._lonlat_to_scene(lon, lat)
+            item = self._scene.addEllipse(
+                scene_pt.x()-r, scene_pt.y()-r, 2*r, 2*r, pen, brush
+            )
+            item.setZValue(10)
+            item.setData(0, {"lon": lon, "lat": lat})
+            self._vertex_items.append(item)
+            
+    def _redraw_shape(self):
+        if self._current_shape_item is not None:
+            self._scene.removeItem(self._current_shape_item)
+            self._current_shape_item = None
+        pen = QPen(QColor(0, 150, 60), 2 / self._zoom_scale_factor())
+        brush = QBrush(QColor(0, 150, 60, 60))
+        p = self._shape_params
+        if self._shape_kind == "rect":
+            tl = self._lonlat_to_scene(p["west"], p["north"])
+            br = self._lonlat_to_scene(p["east"], p["south"])
+            self._current_shape_item = self._scene.addRect(QRectF(tl, br), pen, brush)
+        elif self._shape_kind == "polygon":
+            pts = [self._lonlat_to_scene(lon, lat) for lon, lat in p["points"]]
+            self._current_shape_item = self._scene.addPolygon(QPolygonF(pts), pen, brush)
+            
+    def _highlight_vertex(self, index):
+        if index < len(self._vertex_items):
+            item = self._vertex_items[index]
+            item.setBrush(QBrush(QColor(255, 100, 0)))
+
+    def _unhighlight_vertex(self):
+        for item in self._vertex_items:
+            item.setBrush(QBrush(QColor(0, 150, 60)))
+            
+    def _on_shape_changed_internal(self):
+        win = QApplication.activeWindow()
+        if hasattr(win, 'right_panel'):
+            win.right_panel._on_shape_changed()
+            
+    def set_gpx_tracks(self, gpx_list):
+        for item in self._gpx_items:
+            self._scene.removeItem(item)
+        self._gpx_items = []
+        for gpx in gpx_list:
+            if not gpx.get("enabled"):
+                continue
+            path = gpx.get("path", "")
+            color = gpx.get("color", "#FF0000")
+            if not path or not os.path.exists(path):
+                continue
+            points = self._parse_gpx(path)
+            if len(points) < 2:
+                continue
+            pen = QPen(QColor(color))
+            pen.setWidth(0)
+            for i in range(len(points) - 1):
+                p1 = self._lonlat_to_scene(points[i][0], points[i][1])
+                p2 = self._lonlat_to_scene(points[i+1][0], points[i+1][1])
+                item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), pen)
+                item.setZValue(7)
+                self._gpx_items.append(item)
+
+    def _parse_gpx(self, path):
+        tree = ET.parse(path)
+        root = tree.getroot()
+        ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+        points = []
+        for trkpt in root.findall('.//gpx:trkpt', ns):
+            lat = float(trkpt.attrib['lat'])
+            lon = float(trkpt.attrib['lon'])
+            points.append((lon, lat))
+        return points

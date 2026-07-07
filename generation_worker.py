@@ -13,7 +13,7 @@ if 'topopixel' in sys.modules:
 else:
     import topopixel as tp
 
-def build_clip_mask(shape_kind, shape_params, bbox, rows, cols):
+def build_clip_mask(shape_kind, shape_params, bbox, rows, cols, z_top=None):
 
     def lonlat_to_pixel_xy(lat, lon):
         x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
@@ -71,7 +71,10 @@ def build_clip_mask(shape_kind, shape_params, bbox, rows, cols):
         poly2d = poly2d.buffer(0)
 
     z_bot = -tp.BASE_THICKNESS - 1.0
-    z_top = 50.0
+    if z_top is None:
+        z_top = 50.0
+        print("[CLIP] AVERT : z_top par défaut (50.0) utilisé — aucune hauteur de terrain fournie, "
+              "un relief plus haut que 50 sera coupé")
 
     mask_mesh = trimesh.creation.extrude_polygon(poly2d, height=z_top - z_bot)
     mask_mesh.apply_translation([0, 0, z_bot])
@@ -163,9 +166,7 @@ class GenerationWorker(QThread):
             gpxz_key = self.ui_params.get("GPXZ_API_KEY", tp.GPXZ_API_KEY)
 
             self._emit("Téléchargement du modèle numérique de terrain (DEM)...")
-            dem_path = tp.download_dem_gpxz_tiled(
-                bbox, gpxz_key, resolution_m=resolution_m, cache_dir=cache_dir
-            )
+            dem_path = tp.download_dem_gpxz_tiled(bbox, gpxz_key, resolution_m=resolution_m, cache_dir=cache_dir)
             elevation = tp.load_dem(dem_path)
 
             if "roads" in enabled:
@@ -202,7 +203,25 @@ class GenerationWorker(QThread):
                 buildings = tp.download_buildings(bbox, cache_dir=cache_dir)
             else:
                 buildings = None
-            
+                
+            gpx_list = [g for g in self.ui_params.get("GPX_LIST", []) if g.get("enabled") and g.get("path")]
+                
+            if road_edges is not None:
+                road_levels = self.ui_params.get("ROAD_LEVELS", tp.ROAD_LEVELS)
+                road_edges = road_edges[road_edges["highway"].apply(
+                    lambda h: any(l in (h if isinstance(h, list) else [h]) for l in road_levels)
+                )]
+                
+            if water_areas is not None:
+                wa = water_areas.to_crs("EPSG:3857")
+                water_areas = wa[wa.geometry.area >= tp.MIN_WATER_AREA_M2].to_crs("EPSG:4326")
+            if waterways is not None:
+                ww = waterways.to_crs("EPSG:3857")
+                waterways = ww[ww.geometry.length >= tp.MIN_WATERWAY_LENGTH_M].to_crs("EPSG:4326")
+            if buildings is not None:
+                b = buildings.to_crs("EPSG:3857")
+                buildings = b[b.geometry.area >= tp.MIN_BUILDING_AREA_M2].to_crs("EPSG:4326")
+
             excluded_roads = {osm_id for t, osm_id in excluded_ids if t == "road"}
             excluded_water = {osm_id for t, osm_id in excluded_ids if t == "water"}
             excluded_veg = {osm_id for t, osm_id in excluded_ids if t == "vegetation"}
@@ -223,44 +242,68 @@ class GenerationWorker(QThread):
 
             z_min = elevation.min()
             rows, cols = elevation.shape
-
             scale_mm = tp.SIZE_MM / max(cols - 1, rows - 1)
             self._emit(f"Échelle : 1 pixel = {scale_mm:.4f} mm")
 
             self._emit("Construction du maillage terrain...")
             mesh_terrain = tp.build_terrain_mesh(elevation, z_min) if "terrain" in enabled else trimesh.Trimesh()
+        
+            self._emit("Construction des masques...")
+            roads_mask = tp.build_roads_mask(road_edges, bbox, elevation.shape, mesh_terrain) if "roads" in enabled else None
+            water_mask = tp.build_water_mask(water_areas, waterways, bbox, elevation.shape, mesh_terrain) if "water" in enabled else None
+            veg_mask = tp.build_veg_mask(forest, other_veg, bbox, elevation.shape, mesh_terrain) if "vegetation" in enabled else None
+            buildings_mask, building_meshes = tp.build_buildings_mask(buildings, bbox, elevation.shape, mesh_terrain) if "buildings" in enabled else (None, [])
+            gpx_masks = []
+            if "gpx" in enabled:
+                for gpx in gpx_list:
+                    points = tp.parse_gpx_file(gpx["path"], bbox)
+                    if points:
+                        tp.GPX_WIDTH_PX = self.ui_params.get("GPX_WIDTH_PX", 2.0)
+                        tp.GPX_HEIGHT = self.ui_params.get("GPX_HEIGHT", 4.0)
+                        mask = tp.build_gpx_mask(points, bbox, elevation.shape, mesh_terrain)
+                        if mask:
+                            gpx_masks.append((mask, gpx["color"]))
 
-            self._emit("Découpe des routes...")
-            mesh_roads, mesh_terrain = tp.build_roads_mesh(road_edges, bbox, elevation.shape, mesh_terrain) if "roads" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            self._emit("Simplification...")
+            mesh_terrain = tp.simplify_mesh(mesh_terrain)
+            roads_mask = tp.simplify_mesh(roads_mask) if roads_mask is not None else None
+            water_mask = tp.simplify_mesh(water_mask) if water_mask is not None else None
+            veg_mask = tp.simplify_mesh(veg_mask) if veg_mask is not None else None
+            buildings_mask = tp.simplify_mesh(buildings_mask) if buildings_mask is not None else None
+            gpx_masks = [(tp.simplify_mesh(m), c) for m, c in gpx_masks]
 
-            self._emit("Découpe de l'hydrographie...")
-            mesh_water, mesh_terrain = tp.build_water_mesh(water_areas, waterways, bbox, elevation.shape, mesh_terrain) if "water" in enabled else (trimesh.Trimesh(), mesh_terrain)
-
-            self._emit("Découpe de la végétation...")
-            mesh_veg, mesh_terrain = tp.build_vegetation_mesh(forest, other_veg, elevation, z_min, bbox, mesh_terrain) if "vegetation" in enabled else (trimesh.Trimesh(), mesh_terrain)
-
-            self._emit("Génération des arbres...")
+            self._emit("Application des booléens...")
+            mesh_terrain_pristine = mesh_terrain
+            mesh_roads, mesh_terrain = tp.apply_roads_boolean(roads_mask, mesh_terrain, mesh_terrain_pristine) if "roads" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            mesh_water, mesh_terrain = tp.apply_water_boolean(water_mask, mesh_terrain, mesh_terrain_pristine) if "water" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            mesh_veg, mesh_terrain = tp.apply_veg_boolean(veg_mask, mesh_terrain, mesh_terrain_pristine) if "vegetation" in enabled else (trimesh.Trimesh(), mesh_terrain)
             mesh_trees = tp.build_trees_mesh(forest, bbox, elevation.shape, mesh_veg) if "trees" in enabled else trimesh.Trimesh()
-
-            self._emit("Génération des bâtiments...")
-            mesh_buildings, mesh_terrain = tp.build_buildings_mesh(buildings, bbox, elevation.shape, mesh_terrain) if "buildings" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            mesh_buildings, mesh_terrain = tp.apply_buildings_boolean(buildings_mask, building_meshes, mesh_terrain, mesh_terrain_pristine) if "buildings" in enabled else (trimesh.Trimesh(), mesh_terrain)
             
-            self._emit("Simplification du terrain...")
-            target = min(50000, int(len(mesh_terrain.faces) * 0.5))
-            if target < len(mesh_terrain.faces):
-                mesh_terrain_simplified = mesh_terrain.simplify_quadric_decimation(face_count=target, aggression=3)
-                trimesh.repair.fix_normals(mesh_terrain_simplified)
-                if mesh_terrain_simplified.is_watertight:
-                    mesh_terrain = mesh_terrain_simplified
-                    self._emit(f"Simplification OK : {target} faces")
-                else:
-                    self._emit("Simplification cassée — mesh original conservé")
-            else:
-                self._emit(f"Simplification ignorée — mesh déjà à {len(mesh_terrain.faces)} faces")
-                
+            mesh_gpx_list = []
+            for gpx_mask, gpx_color in gpx_masks:
+                other = {"roads": mesh_roads, "water": mesh_water, "veg": mesh_veg,
+                         "buildings": mesh_buildings, "trees": mesh_trees}
+                mg, mesh_terrain, other, failed_cuts = tp.apply_gpx_boolean(gpx_mask, mesh_terrain, mesh_terrain_pristine, other)
+                mesh_roads = other["roads"]
+                mesh_water = other["water"]
+                mesh_veg = other["veg"]
+                mesh_buildings = other["buildings"]
+                mesh_trees = other["trees"]
+                mesh_gpx_list.append((mg, gpx_color))
+                if failed_cuts:
+                    self._emit(f"  ATTENTION : découpe GPX échouée pour {', '.join(failed_cuts)} "
+                                f"— le GPX pourra être masqué par ces couches à cet endroit")
+
+            faces = mesh_terrain.faces
+            unique_faces, counts = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
+            dup_mask = counts > 1
+            print(f"[TERRAIN] faces dupliquées: {dup_mask.sum()}")
+
             if self.shape_kind != "rect":
                 self._emit("Découpe à la forme...")
-                clip_mask = build_clip_mask(self.shape_kind, self.shape_params, bbox, rows, cols)
+                terrain_z_top = mesh_terrain.bounds[1][2] + 1.0
+                clip_mask = build_clip_mask(self.shape_kind, self.shape_params, bbox, rows, cols, z_top=terrain_z_top)
                 if clip_mask is not None and clip_mask.is_watertight:
                     meshes = {
                         "terrain": mesh_terrain,
@@ -283,12 +326,27 @@ class GenerationWorker(QThread):
                         except Exception as e:
                             self._emit(f"  {name} : clip échoué ({e}), mesh original conservé")
                             clipped[name] = mesh
-                    mesh_terrain  = clipped["terrain"]
+                    mesh_terrain = clipped["terrain"]
                     mesh_roads = clipped["roads"]
                     mesh_water = clipped["water"]
                     mesh_veg = clipped["veg"]
                     mesh_trees = clipped["trees"]
                     mesh_buildings = clipped["buildings"]
+
+                    clipped_gpx_list = []
+                    for mg, gpx_color in mesh_gpx_list:
+                        if len(mg.faces) == 0:
+                            clipped_gpx_list.append((mg, gpx_color))
+                            continue
+                        try:
+                            result = trimesh.boolean.intersection([mg, clip_mask], engine='manifold')
+                            trimesh.repair.fix_normals(result)
+                            self._emit(f"  gpx : {len(mg.faces)} → {len(result.faces)} faces watertight={result.is_watertight}")
+                            clipped_gpx_list.append((result, gpx_color))
+                        except Exception as e:
+                            self._emit(f"  gpx : clip échoué ({e}), mesh original conservé")
+                            clipped_gpx_list.append((mg, gpx_color))
+                    mesh_gpx_list = clipped_gpx_list
                 else:
                     self._emit("Masque invalide — découpe ignorée")
 
@@ -310,6 +368,13 @@ class GenerationWorker(QThread):
             mesh_veg.apply_transform(scale_matrix)
             mesh_trees.apply_transform(scale_matrix)
             mesh_buildings.apply_transform(scale_matrix)
+            
+            mesh_gpx_list = [
+                (tp.add_anchor(mg, cols, rows) if len(mg.faces) > 0 else mg, c)
+                for mg, c in mesh_gpx_list
+            ]
+            for mg, _ in mesh_gpx_list:
+                mg.apply_transform(scale_matrix)
 
             self._emit("Export des fichiers STL...")
             stl_dir = self.ui_params.get("STL_DIR", "STL")
@@ -317,12 +382,25 @@ class GenerationWorker(QThread):
                 "terrain_base.stl", "terrain_roads.stl", "terrain_water.stl",
                 "terrain_vegetation.stl", "terrain_trees.stl", "terrain_buildings.stl",
             ]
+            gpx_files = [os.path.join(stl_dir, f"terrain_gpx_{i}.stl") for i in range(len(mesh_gpx_list))]
             meshes = [mesh_terrain, mesh_roads, mesh_water, mesh_veg, mesh_trees, mesh_buildings]
             for mesh, fname in zip(meshes, files):
                 tp.save_mesh(mesh, os.path.join(stl_dir, fname))
+            for i, (mg, _) in enumerate(mesh_gpx_list):
+                tp.save_mesh(mg, os.path.join(stl_dir, f"terrain_gpx_{i}.stl"))
+                
+            self._emit("Export 3MF...")
+            project_name = self.ui_params.get("PROJECT_NAME", "topopixel")
+            tp.save_3mf(
+                [mesh_terrain, mesh_roads, mesh_water, mesh_veg, mesh_trees, mesh_buildings],
+                [os.path.join(stl_dir, f) for f in files],
+                os.path.join(stl_dir, f"{project_name}.3mf"),
+                gpx_list=gpx_list
+            )
 
             self._emit("Terminé.")
-            self.finished_ok.emit({"files": [os.path.join(stl_dir, f) for f in files]})
+            
+            self.finished_ok.emit({"files": [os.path.join(stl_dir, f) for f in files] + gpx_files})
 
         except Exception:
             self.failed.emit(traceback.format_exc())
