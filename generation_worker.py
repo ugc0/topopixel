@@ -398,6 +398,15 @@ class GenerationWorker(QThread):
                 gpx_list=gpx_list
             )
 
+            metadata = {
+                "resolution_m": self.ui_params.get("RESOLUTION_M", tp.RESOLUTION_M),
+                "cols": cols,
+                "rows": rows,
+                "scale_mm": scale_mm,
+            }
+            with open(os.path.join(stl_dir, "metadata.json"), "w") as f:
+                json.dump(metadata, f)
+
             self._emit("Terminé.")
             
             self.finished_ok.emit({"files": [os.path.join(stl_dir, f) for f in files] + gpx_files})

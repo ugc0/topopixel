@@ -1590,6 +1590,16 @@ def _osm_cache_path(bbox, data_type, cache_dir=CACHE_DIR):
     key = f"{data_type}_{bbox['south']:.6f}_{bbox['north']:.6f}_{bbox['west']:.6f}_{bbox['east']:.6f}"
     return os.path.join(cache_dir, "osm", f"{key}.pkl")
 
+def _parse_osm_cache_bbox(fname):
+    m = re.match(
+        r"(\w+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)\.pkl",
+        fname
+    )
+    if not m:
+        return None
+    data_type, s, n, w, e = m.groups()
+    return {"data_type": data_type, "south": float(s), "north": float(n), "west": float(w), "east": float(e)}
+
 def _osm_cache_load(bbox, data_type, cache_dir=CACHE_DIR):
     osm_dir = os.path.join(cache_dir, "osm")
     if not os.path.isdir(osm_dir):
@@ -1600,13 +1610,10 @@ def _osm_cache_load(bbox, data_type, cache_dir=CACHE_DIR):
     w = trunc(bbox["west"])
     e = trunc(bbox["east"])
     for fname in os.listdir(osm_dir):
-        m = re.match(
-            rf"{data_type}_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)\.pkl",
-            fname
-        )
-        if not m:
+        parsed = _parse_osm_cache_bbox(fname)
+        if parsed is None or parsed["data_type"] != data_type:
             continue
-        cs, cn, cw, ce = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+        cs, cn, cw, ce = parsed["south"], parsed["north"], parsed["west"], parsed["east"]
         if cs <= s and cn >= n and cw <= w and ce >= e:
             print(f"[OSM CACHE] hit : {fname}")
             fpath = os.path.join(osm_dir, fname)

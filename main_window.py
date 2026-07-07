@@ -4,8 +4,13 @@ import sys
 import traceback
 import json
 import copy
+import platform
 
-os.system("cls")
+if platform.system() == "Linux":
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.system("clear")
+else:
+    os.system("cls")
 
 def excepthook(type, value, tb):
     print("".join(traceback.format_exception(type, value, tb)))
@@ -652,6 +657,7 @@ class MainWindow(QMainWindow):
         self.map_canvas._tooltip.exclusion_changed.connect(self._on_exclusion_changed_count)
         self.param_panel.gpx_changed.connect(self._on_gpx_changed)
         self.param_panel.cache_coverage_toggled.connect(self._on_cache_coverage_toggled)
+        self.param_panel.osm_cache_coverage_toggled.connect(self._on_osm_cache_coverage_toggled)
         
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -967,6 +973,27 @@ class MainWindow(QMainWindow):
                 if parsed is not None and parsed["resolution_m"] == resolution_m:
                     bboxes.append(parsed)
         self.map_canvas.show_cache_coverage(bboxes)
+
+    def _on_osm_cache_coverage_toggled(self, checked):
+        if not checked:
+            self.map_canvas.clear_osm_cache_coverage()
+            return
+        params = self.param_panel.get_params()
+        cache_dir = params.get("CACHE_DIR", "cache")
+        osm_dir = os.path.join(cache_dir, "osm")
+        bboxes = []
+        seen = set()
+        if os.path.isdir(osm_dir):
+            for fname in os.listdir(osm_dir):
+                parsed = tp._parse_osm_cache_bbox(fname)
+                if parsed is None:
+                    continue
+                key = (parsed["south"], parsed["north"], parsed["west"], parsed["east"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                bboxes.append(parsed)
+        self.map_canvas.show_osm_cache_coverage(bboxes)
 
 def _qt_message_filter(msg_type, context, message):
     

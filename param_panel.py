@@ -216,6 +216,7 @@ class ParamPanel(QWidget):
     color_changed = pyqtSignal(str, str)
     gpx_changed = pyqtSignal()
     cache_coverage_toggled = pyqtSignal(bool)
+    osm_cache_coverage_toggled = pyqtSignal(bool)
 
     def _build_general_group(self):
         section = CollapsibleSection("Général", accent="#9C36B5")
@@ -426,6 +427,7 @@ class ParamPanel(QWidget):
         self._fields["STL_DIR"] = stl_dir
         form.addRow("Dossier STL", stl_dir)
         
+        form.addRow("Gestion du cache")
         self._btn_clear_cache = QPushButton("Effacer le cache (calcul en cours...)")
         self._btn_clear_cache.clicked.connect(self._on_clear_cache)
         form.addRow(self._btn_clear_cache)
@@ -436,6 +438,12 @@ class ParamPanel(QWidget):
         self._btn_cache_coverage.setChecked(False)
         self._btn_cache_coverage.toggled.connect(self.cache_coverage_toggled.emit)
         form.addRow(self._btn_cache_coverage)
+
+        self._btn_osm_cache_coverage = QPushButton("Afficher couverture cache OSM")
+        self._btn_osm_cache_coverage.setCheckable(True)
+        self._btn_osm_cache_coverage.setChecked(False)
+        self._btn_osm_cache_coverage.toggled.connect(self.osm_cache_coverage_toggled.emit)
+        form.addRow(self._btn_osm_cache_coverage)
 
         return section
 

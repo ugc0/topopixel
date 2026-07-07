@@ -126,8 +126,6 @@ class MapCanvas(QGraphicsView):
         
         self._pan_start_scene = QPointF()
         self._pan_start_mouse = QPointF()
-
-        self.set_center(*self._center_lonlat, self._current_zoom)
         
         self._search_bar = QLineEdit(self)
         self._search_bar.setPlaceholderText("🔍 Rechercher un lieu...")
@@ -179,6 +177,41 @@ class MapCanvas(QGraphicsView):
         self._search_timer.timeout.connect(self._on_search)
         self._search_bar.textChanged.connect(self._on_search_text_changed)
 
+        self._fit_shape_btn = QPushButton("⛶", self)
+        self._fit_shape_btn.setFixedSize(36, 36)
+        self._fit_shape_btn.setToolTip("Recentrer sur l'emprise")
+        self._fit_shape_btn.setStyleSheet("""
+            QPushButton {
+                background: #3C3C3C;
+                color: #DDDDDD;
+                border: 1px solid #555555;
+                border-radius: 18px;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background: #4A4A4A;
+            }
+        """)
+        self._fit_shape_btn.clicked.connect(self.zoom_to_fit_shape)
+        self._fit_shape_btn.setVisible(False)
+        self._fit_shape_btn.raise_()
+        self.setMouseTracking(True)
+        self.shape_changed.connect(self._update_fit_btn_visibility)
+
+        self._scale_label = QLabel(self)
+        self._scale_label.setStyleSheet("""
+            QLabel {
+                background: #3C3C3C;
+                color: #DDDDDD;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+        """)
+        self._scale_label.setFixedHeight(20)
+        self._scale_label.raise_()
+
         self._polygon_points = []
         self._draw_shape_item = None
         
@@ -202,6 +235,8 @@ class MapCanvas(QGraphicsView):
         self._vertex_drag_timer = QTimer(self)
         self._vertex_drag_timer.setSingleShot(True)
         self._vertex_drag_timer.timeout.connect(self.shape_changed.emit)
+
+        self.set_center(*self._center_lonlat, self._current_zoom)
         
     def _on_exclusion_changed(self, key, excluded):
         layer_type, osm_id = key
@@ -243,6 +278,7 @@ class MapCanvas(QGraphicsView):
         self.scale(scale, scale)
         self.centerOn(self._lonlat_to_scene(lon, lat))
         self._refresh_tiles()
+        self._update_scale_label()
 
     def center_lonlat(self):
         center_scene = self.mapToScene(self.viewport().rect().center())
@@ -501,6 +537,7 @@ class MapCanvas(QGraphicsView):
         self.translate(delta.x(), delta.y())
 
         self._refresh_tiles()
+        self._update_scale_label()
         event.accept()
 
     def resizeEvent(self, event):
@@ -508,9 +545,11 @@ class MapCanvas(QGraphicsView):
         self._refresh_tiles()
         w = min(400, self.width() - 40)
         self._search_bar.setFixedWidth(w)
-        self._search_bar.move((self.width() - w) // 2, 12)
         self._search_suggestions.setFixedWidth(w)
+        self._search_bar.move((self.width() - w) // 2, 12)
         self._search_suggestions.move((self.width() - w) // 2, 12 + 36 + 4)
+        self._fit_shape_btn.move(self.width() - 36 - 12, 12)
+        self._update_scale_label()
 
     def set_draw_tool(self, tool):
         self._draw_tool = tool
@@ -806,6 +845,26 @@ class MapCanvas(QGraphicsView):
             self._clear_osm_preview(layer)
         self._osm_preview_edges.clear()
 
+    def show_osm_cache_coverage(self, bboxes):
+        self.clear_osm_cache_coverage()
+        pen = QPen(QColor(230, 126, 34, 200))
+        pen.setWidth(2)
+        brush = QBrush(QColor(230, 126, 34, 60))
+        items = []
+        for bbox in bboxes:
+            top_left = self._lonlat_to_scene(bbox["west"], bbox["north"])
+            bottom_right = self._lonlat_to_scene(bbox["east"], bbox["south"])
+            rect = QRectF(top_left, bottom_right)
+            item = self._scene.addRect(rect, pen, brush)
+            item.setZValue(5)
+            items.append(item)
+        self._osm_cache_coverage_items = items
+
+    def clear_osm_cache_coverage(self):
+        for item in getattr(self, "_osm_cache_coverage_items", []):
+            self._scene.removeItem(item)
+        self._osm_cache_coverage_items = []
+
     def show_cache_coverage(self, bboxes):
         self.clear_cache_coverage()
         pen = QPen(QColor(70, 130, 180, 200))
@@ -1044,6 +1103,48 @@ class MapCanvas(QGraphicsView):
             return Polygon([(lon, lat) for lon, lat in p["points"]])
         return None
 
+    def zoom_to_fit_shape(self):
+        shape = self._shape_as_shapely()
+        if shape is None:
+            return
+        min_lon, min_lat, max_lon, max_lat = shape.bounds
+        center_lon = (min_lon + max_lon) / 2
+        center_lat = (min_lat + max_lat) / 2
+        top_left = self._lonlat_to_scene(min_lon, max_lat)
+        bottom_right = self._lonlat_to_scene(max_lon, min_lat)
+        rect = QRectF(top_left, bottom_right)
+        margin = max(rect.width(), rect.height()) * 0.1
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        viewport_size = min(self.viewport().width(), self.viewport().height())
+        content_size = max(rect.width(), rect.height())
+        raw_zoom = self.REF_ZOOM + math.log2(viewport_size / content_size)
+        zoom = max(MIN_ZOOM, min(MAX_ZOOM, round(raw_zoom)))
+        self.set_center(center_lon, center_lat, zoom)
+
+    def _update_scale_label(self):
+        center_lat = self._center_lonlat[1]
+        meters_per_pixel = 156543.03392 * math.cos(math.radians(center_lat)) / (2 ** self._current_zoom)
+        target_px = 80
+        raw_meters = meters_per_pixel * target_px
+        steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
+        nice_meters = min(steps, key=lambda s: abs(s - raw_meters))
+        bar_px = round(nice_meters / meters_per_pixel)
+        label_text = f"{nice_meters} m" if nice_meters < 1000 else f"{nice_meters // 1000} km"
+        self._scale_label.setText(label_text)
+        self._scale_label.setFixedWidth(bar_px)
+        self._scale_label.move(self.width() - bar_px - 12, self.height() - 20 - 12)
+
+    def _update_fit_btn_visibility(self):
+        self._fit_shape_btn.setVisible(self._shape_kind is not None and self.underMouse())
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._update_fit_btn_visibility()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._fit_shape_btn.setVisible(False)
+
     def get_excluded_ids(self):
         return set(self._tooltip._excluded_ids)
         
@@ -1141,6 +1242,8 @@ class MapCanvas(QGraphicsView):
         self._search_suggestions.setFixedWidth(w)
         self._search_bar.move((self.width() - w) // 2, 12)
         self._search_suggestions.move((self.width() - w) // 2, 12 + 36 + 4)
+        self._fit_shape_btn.move(self.width() - 36 - 12, 12)
+        self._update_scale_label()
         
     def _on_search_focus_out(self, event):
         self._search_suggestions.setVisible(False)
