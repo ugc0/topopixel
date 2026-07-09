@@ -1,13 +1,15 @@
+from logger import log
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QDoubleSpinBox, QSpinBox,
     QCheckBox, QLineEdit, QScrollArea, QLabel, QSizePolicy,
-    QToolButton, QFrame, QPushButton, QColorDialog, QHBoxLayout, QFileDialog, QSlider, QMenu, QWidgetAction
+    QToolButton, QFrame, QPushButton, QColorDialog, QHBoxLayout, QFileDialog, QSlider, QMenu, QWidgetAction, QMessageBox, QStackedLayout
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QEvent, QLocale
+from PyQt6.QtGui import QColor, QDoubleValidator, QIntValidator
 
 from constants import TOPIC_COLORS, checkbox_style, color_button_style
+from tooltips import TOOLTIPS
 import topopixel as tp
 import shutil
 
@@ -83,6 +85,83 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
 }}
 """
+
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+from PyQt6.QtGui import QIntValidator, QDoubleValidator
+
+class EditableValue(QWidget):
+    valueChanged = pyqtSignal(object)
+
+    def __init__(self, value, lo, hi, decimals=None, parent=None):
+        super().__init__(parent)
+        self.lo = lo
+        self.hi = hi
+        self.decimals = decimals
+
+        self._stack = QStackedLayout(self)
+        self._stack.setContentsMargins(0, 0, 0, 0)
+
+        self.label = QLabel(self._fmt(value))
+        self.label.setMinimumWidth(50)
+
+        self.edit = QLineEdit(self._fmt(value))
+        self.edit.setMinimumWidth(50)
+        if decimals is None:
+            self.edit.setValidator(QIntValidator(lo, hi, self))
+        else:
+            validator = QDoubleValidator(lo, hi, decimals, self)
+            validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+            self.edit.setValidator(validator)
+
+        self._stack.addWidget(self.label)
+        self._stack.addWidget(self.edit)
+        self._stack.setCurrentWidget(self.label)
+        
+        if decimals is None:
+            self.edit.setValidator(QIntValidator(lo, hi, self))
+        else:
+            validator = QDoubleValidator(lo, hi, decimals, self)
+            validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+            validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+            self.edit.setValidator(validator)
+
+        self.edit.editingFinished.connect(self._finish_edit)
+
+    def _fmt(self, v):
+        return f"{v:.{self.decimals}f}" if self.decimals is not None else str(v)
+
+    def _parse(self, text):
+        return float(text) if self.decimals is not None else int(text)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.edit.setText(self.label.text())
+            self.edit.selectAll()
+            self._stack.setCurrentWidget(self.edit)
+            self.edit.setFocus()
+        super().mouseDoubleClickEvent(event)
+
+    def _finish_edit(self):
+        try:
+            v = self._parse(self.edit.text().replace(",", "."))
+        except ValueError:
+            v = self._parse(self.label.text())
+        v = max(self.lo, min(self.hi, v))
+        self.set_value(v)
+        self.valueChanged.emit(v)
+
+    def set_value(self, v):
+        self.label.setText(self._fmt(v))
+        self.edit.setText(self._fmt(v))
+        self._stack.setCurrentWidget(self.label)
 
 class CollapsibleSection(QFrame):
 
@@ -211,21 +290,25 @@ class ParamPanel(QWidget):
         layout.addStretch(1)
         
     road_levels_changed = pyqtSignal()
+    railway_option_changed = pyqtSignal()
     water_filter_changed = pyqtSignal()
     building_filter_changed = pyqtSignal()
     color_changed = pyqtSignal(str, str)
     gpx_changed = pyqtSignal()
     cache_coverage_toggled = pyqtSignal(bool)
     osm_cache_coverage_toggled = pyqtSignal(bool)
+    layer_enabled_changed = pyqtSignal(str, bool)
 
     def _build_general_group(self):
         section = CollapsibleSection("Général", accent="#9C36B5")
         form = section.form()
 
-        self._add_int(form, "RESOLUTION_M", "Résolution DEM (m/px)", 5, 1, 30)
+        self._add_int(form, "RESOLUTION_M", "Résolution DEM (m/px)", 5, 1, 30, tooltip=TOOLTIPS.get("RESOLUTION_M"))
         self._fields["RESOLUTION_M"].valueChanged.connect(lambda: self.cache_coverage_toggled.emit(self._btn_cache_coverage.isChecked()))
-        self._add_int(form, "SIZE_MM", "Taille impression (mm)", 120, 10, 500, 1)
-        self._add_int(form, "BASE_THICKNESS", "Épaisseur socle", 20, 1, 200, 1)
+        self._add_int(form, "SIZE_MM", "Taille impression (mm)", 120, 10, 500, 1, tooltip=TOOLTIPS.get("SIZE_MM"))
+        self._add_int(form, "BASE_THICKNESS", "Épaisseur socle", 20, 1, 200, 1, tooltip=TOOLTIPS.get("BASE_THICKNESS"))
+        self._add_double(form, "Z_SCALE", "Exagération verticale", 1.0, 0.1, 5.0, 0.1, tooltip=TOOLTIPS.get("Z_SCALE"))
+        self._add_int(form, "PUZZLE_N_PIECES", "Nombre de pièces puzzle", 0, 0, 16, 1, tooltip=TOOLTIPS.get("PUZZLE_N_PIECES"))
         
         lbl_layers = QLabel("Couches à générer :")
         form.addRow(lbl_layers)
@@ -249,6 +332,7 @@ class ParamPanel(QWidget):
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.setStyleSheet(checkbox_style(TOPIC_COLORS.get(key, "#888888")))
+            cb.stateChanged.connect(lambda state, k=key: self.layer_enabled_changed.emit(k, state == Qt.CheckState.Checked.value))
             self._layer_checkboxes[key] = cb
             btn = QPushButton()
             btn.setStyleSheet(color_button_style(TOPIC_COLORS.get(key, "#888888")))
@@ -342,10 +426,18 @@ class ParamPanel(QWidget):
             non_drivable_menu.addAction(action)
         non_drivable_button.setMenu(non_drivable_menu)
         section.add_widget(non_drivable_button)
+        
+        railway_cb = QCheckBox("Inclure les voies ferrées")
+        railway_cb.setChecked(False)
+        railway_cb.setStyleSheet("QCheckBox { color: #DDDDDD; }")
+        railway_cb.stateChanged.connect(lambda: self.railway_option_changed.emit())
+        self._fields["INCLUDE_RAILWAYS"] = railway_cb
+        section.add_widget(railway_cb)
 
         form = section.form()
-        self._add_int(form, "ROAD_WIDTH_PX", "Largeur route (px)", 1, 1, 20, 1)
-        self._add_int(form, "ROAD_HEIGHT", "Surélévation route", 6, 0, 50, 1)
+        self._add_int(form, "ROAD_WIDTH_PX", "Largeur route (px)", 1, 1, 20, 1, handle_color="#CCCCCC", tooltip=TOOLTIPS.get("ROAD_WIDTH_PX"))
+        self._add_int(form, "ROAD_HEIGHT", "Surélévation route", 6, 0, 50, 1, handle_color="#CCCCCC", tooltip=TOOLTIPS.get("ROAD_HEIGHT"))
+        self._add_int(form, "ROADS_Z_BOT_RATIO_PCT", "Profondeur socle routes (%)", 33, 0, 100, 1, handle_color="#CCCCCC", tooltip=TOOLTIPS.get("ROADS_Z_BOT_RATIO_PCT"))
 
         return section
 
@@ -353,13 +445,20 @@ class ParamPanel(QWidget):
         section = CollapsibleSection("Hydrographie", accent="#1971C2", expanded=False)
         form = section.form()
 
-        self._add_int(form, "RIVER_WIDTH_PX", "Largeur cours d'eau (px)", 3, 1, 30, 1)
-        self._add_int(form, "WATER_HEIGHT", "Surélévation eau", 3, 0, 50, 1)
-        self._add_int(form, "MIN_WATER_AREA_M2", "Surface min plan d'eau (m²)", 5000, 0, 1_000_000, 100)
-        self._add_int(form, "MIN_WATERWAY_LENGTH_M", "Longueur min cours d'eau (m)", 500, 0, 100_000, 50)
+        self._add_int(form, "RIVER_WIDTH_PX", "Largeur cours d'eau (px)", 3, 1, 30, 1, handle_color=TOPIC_COLORS["water"], tooltip=TOOLTIPS.get("RIVER_WIDTH_PX"))
+        self._add_int(form, "WATER_HEIGHT", "Surélévation eau", 3, 0, 50, 1, handle_color=TOPIC_COLORS["water"], tooltip=TOOLTIPS.get("WATER_HEIGHT"))
+        self._add_int(form, "MIN_WATER_AREA_M2", "Surface min plan d'eau (m²)", 5000, 0, 1_000_000, 100, handle_color=TOPIC_COLORS["water"], tooltip=TOOLTIPS.get("MIN_WATER_AREA_M2"))
+        self._add_int(form, "MIN_WATERWAY_LENGTH_M", "Longueur min cours d'eau (m)", 500, 0, 100_000, 50, handle_color=TOPIC_COLORS["water"], tooltip=TOOLTIPS.get("MIN_WATERWAY_LENGTH_M"))
+        self._add_int(form, "WATER_Z_BOT_RATIO_PCT", "Profondeur socle eau (%)", 33, 0, 100, 1, handle_color=TOPIC_COLORS["water"], tooltip=TOOLTIPS.get("WATER_Z_BOT_RATIO_PCT"))
         
         self._fields["MIN_WATER_AREA_M2"].valueChanged.connect(lambda: self.water_filter_changed.emit())
         self._fields["MIN_WATERWAY_LENGTH_M"].valueChanged.connect(lambda: self.water_filter_changed.emit())
+        
+        bathy_cb = QCheckBox("Activer la bathymétrie")
+        bathy_cb.setChecked(False)
+        bathy_cb.setStyleSheet(f"QCheckBox {{ color: {TOPIC_COLORS['water']}; }}")
+        self._fields["ENABLE_BATHYMETRY"] = bathy_cb
+        section.add_widget(bathy_cb)
 
         return section
 
@@ -367,9 +466,10 @@ class ParamPanel(QWidget):
         section = CollapsibleSection("Végatation", accent="#2F9E44", expanded=False)
         form = section.form()
 
-        self._add_int(form, "TREE_HEIGHT", "Hauteur arbre", 3, 1, 50, 1)
-        self._add_int(form, "TREE_RADIUS", "Rayon base arbre", 1, 1, 20, 1)
-        self._add_int(form, "TREE_DENSITY", "Densité arbres (‰ par px²)", 8, 0, 500, 1)
+        self._add_int(form, "TREE_HEIGHT", "Hauteur arbre", 3, 1, 50, 1, handle_color=TOPIC_COLORS["vegetation"], tooltip=TOOLTIPS.get("TREE_HEIGHT"))
+        self._add_int(form, "TREE_RADIUS", "Rayon base arbre", 1, 1, 20, 1, handle_color=TOPIC_COLORS["vegetation"], tooltip=TOOLTIPS.get("TREE_RADIUS"))
+        self._add_int(form, "TREE_DENSITY", "Densité arbres (‰ par px²)", 8, 0, 500, 1, handle_color=TOPIC_COLORS["vegetation"], tooltip=TOOLTIPS.get("TREE_DENSITY"))
+        self._add_int(form, "VEG_Z_BOT_RATIO_PCT", "Profondeur socle végétation (%)", 90, 0, 100, 1, handle_color=TOPIC_COLORS["vegetation"], tooltip=TOOLTIPS.get("VEG_Z_BOT_RATIO_PCT"))
 
         return section
 
@@ -377,12 +477,13 @@ class ParamPanel(QWidget):
         section = CollapsibleSection("Bâtiments", accent="#495057", expanded=False)
         form = section.form()
 
-        self._add_int(form, "MIN_BUILDING_AREA_M2", "Surface min bâtiment (m²)", 250, 0, 100_000, 10)
-        self._add_int(form, "DEFAULT_BUILDING_HEIGHT_M", "Hauteur par défaut (m)", 6, 1, 200, 1)
-        self._add_int(form, "METERS_PER_LEVEL", "Mètres par étage", 3, 1, 10, 1)
-        self._add_int(form, "BUILDING_HEIGHT_SCALE", "Échelle hauteur bâtiment", 10, 1, 100, 1)
-        self._add_int(form, "BUILDING_MIN_HEIGHT", "Hauteur min (modèle)", 2, 0, 100, 1)
-        self._add_int(form, "BUILDING_MAX_HEIGHT", "Hauteur max (modèle)", 20, 0, 200, 1)
+        self._add_int(form, "MIN_BUILDING_AREA_M2", "Surface min bâtiment (m²)", 250, 0, 100_000, 10, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("MIN_BUILDING_AREA_M2"))
+        self._add_int(form, "DEFAULT_BUILDING_HEIGHT_M", "Hauteur par défaut (m)", 6, 1, 200, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("DEFAULT_BUILDING_HEIGHT_M"))
+        self._add_int(form, "METERS_PER_LEVEL", "Mètres par étage", 3, 1, 10, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("METERS_PER_LEVEL"))
+        self._add_int(form, "BUILDING_HEIGHT_SCALE", "Échelle hauteur bâtiment", 10, 1, 100, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("BUILDING_HEIGHT_SCALE"))
+        self._add_int(form, "BUILDING_MIN_HEIGHT", "Hauteur min (modèle)", 2, 0, 100, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("BUILDING_MIN_HEIGHT"))
+        self._add_int(form, "BUILDING_MAX_HEIGHT", "Hauteur max (modèle)", 20, 0, 200, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("BUILDING_MAX_HEIGHT"))
+        self._add_int(form, "BUILDINGS_Z_BOT_RATIO_PCT", "Profondeur socle bâtiments (%)", 90, 0, 100, 1, handle_color=TOPIC_COLORS["buildings"], tooltip=TOOLTIPS.get("BUILDINGS_Z_BOT_RATIO_PCT"))
         
         self._fields["MIN_BUILDING_AREA_M2"].valueChanged.connect(lambda: self.building_filter_changed.emit())
 
@@ -402,22 +503,18 @@ class ParamPanel(QWidget):
         section.add_widget(btn_add)
 
         form = section.form()
-        self._add_int(form, "GPX_WIDTH_PX", "Largeur tracé (px)", 2, 1, 20, 1)
-        self._add_int(form, "GPX_HEIGHT", "Hauteur au-dessus", 4, 0, 50, 1)
+        self._add_int(form, "GPX_WIDTH_PX", "Largeur tracé (px)", 2, 1, 20, 1, handle_color=TOPIC_COLORS["gpx"], tooltip=TOOLTIPS.get("GPX_WIDTH_PX"))
+        self._add_int(form, "GPX_HEIGHT", "Hauteur au-dessus", 4, 0, 50, 1, handle_color=TOPIC_COLORS["gpx"], tooltip=TOOLTIPS.get("GPX_HEIGHT"))
+        self._add_int(form, "GPX_Z_BOT_RATIO_PCT", "Profondeur socle GPX (%)", 95, 0, 100, 1, handle_color=TOPIC_COLORS["gpx"], tooltip=TOOLTIPS.get("GPX_Z_BOT_RATIO_PCT"))
 
         return section
 
     def _build_advanced_group(self):
         section = CollapsibleSection(
             "Avancé", accent="#9C36B5", expanded=False,
-            hint="Clé API et dossiers de cache et d'export du modèle numérique de terrain."
+            hint="Gestion du cache et clé API"
         )
         form = section.form()
-
-        gpxz_key = QLineEdit("ak_0KtNnPbu_v9orPuogXRYmTu0p")
-        gpxz_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._fields["GPXZ_API_KEY"] = gpxz_key
-        form.addRow("Clé API GPXZ", gpxz_key)
 
         cache_dir = QLineEdit("cache")
         self._fields["CACHE_DIR"] = cache_dir
@@ -427,7 +524,7 @@ class ParamPanel(QWidget):
         self._fields["STL_DIR"] = stl_dir
         form.addRow("Dossier STL", stl_dir)
         
-        form.addRow("Gestion du cache")
+        form.addRow(QLabel("Gestion du cache"))
         self._btn_clear_cache = QPushButton("Effacer le cache (calcul en cours...)")
         self._btn_clear_cache.clicked.connect(self._on_clear_cache)
         form.addRow(self._btn_clear_cache)
@@ -444,41 +541,93 @@ class ParamPanel(QWidget):
         self._btn_osm_cache_coverage.setChecked(False)
         self._btn_osm_cache_coverage.toggled.connect(self.osm_cache_coverage_toggled.emit)
         form.addRow(self._btn_osm_cache_coverage)
+        
+        gpxz_key = QLineEdit("ak_0KtNnPbu_v9orPuogXRYmTu0p")
+        gpxz_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._fields["GPXZ_API_KEY"] = gpxz_key
+        form.addRow("Clé API GPXZ", gpxz_key)
 
         return section
 
-    def _add_double(self, form, key, label, default, lo, hi, step):
+    def _make_label_with_info(self, label, tooltip, handle_color="#FFFFFF", reset_callback=None):
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        lbl = ClickableLabel(label)
+        if reset_callback:
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            reset_hint = "Cliquer pour réinitialiser à la valeur par défaut"
+            lbl.setToolTip(f"{tooltip}\n\n{reset_hint}" if tooltip else reset_hint)
+            lbl.clicked.connect(reset_callback)
+        layout.addWidget(lbl)
+
+        if tooltip:
+            info = QLabel("ⓘ")
+            info.setStyleSheet("color: "+handle_color+"; font-weight: bold;")
+            info.setToolTip(tooltip)
+            info.setCursor(Qt.CursorShape.WhatsThisCursor)
+            layout.addWidget(info)
+
+        layout.addStretch()
+        return container
+
+    def _add_double(self, form, key, label, default, lo, hi, step, handle_color="#FFFFFF", tooltip=None):
         decimals = 4 if step < 0.01 else (3 if step < 1 else 1)
         scale = 10 ** decimals
+
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(int(lo * scale), int(hi * scale))
         slider.setSingleStep(max(1, int(step * scale)))
         slider.setValue(int(default * scale))
-        value_lbl = QLabel(f"{default:.{decimals}f}")
-        value_lbl.setMinimumWidth(50)
+        if handle_color:
+            slider.setStyleSheet(f"QSlider::handle:horizontal {{ background: {handle_color}; }}")
+
+        value_widget = EditableValue(default, lo, hi, decimals=decimals)
+
         row = QHBoxLayout()
         row.addWidget(slider)
-        row.addWidget(value_lbl)
-        slider.valueChanged.connect(lambda v: value_lbl.setText(f"{v / scale:.{decimals}f}"))
+        row.addWidget(value_widget)
+
+        slider.valueChanged.connect(lambda v: value_widget.set_value(v / scale))
+        value_widget.valueChanged.connect(lambda v: slider.setValue(int(round(v * scale))))
+
         slider.decimals = decimals
         slider.scale = scale
         self._fields[key] = slider
-        form.addRow(label, row)
 
-    def _add_int(self, form, key, label, default, lo, hi, step=1):
+        label_widget = self._make_label_with_info(
+            label, tooltip, handle_color,
+            reset_callback=lambda: slider.setValue(int(default * scale))
+        )
+        form.addRow(label_widget, row)
+    
+    def _add_int(self, form, key, label, default, lo, hi, step=1, handle_color="#FFFFFF", tooltip=None):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(lo, hi)
         slider.setSingleStep(step)
         slider.setValue(default)
-        value_lbl = QLabel(str(default))
-        value_lbl.setMinimumWidth(50)
+        if handle_color:
+            slider.setStyleSheet(f"QSlider::handle:horizontal {{ background: {handle_color}; }}")
+
+        value_widget = EditableValue(default, lo, hi, decimals=None)
+
         row = QHBoxLayout()
         row.addWidget(slider)
-        row.addWidget(value_lbl)
-        slider.valueChanged.connect(lambda v: value_lbl.setText(str(v)))
+        row.addWidget(value_widget)
+
+        slider.valueChanged.connect(value_widget.set_value)
+        value_widget.valueChanged.connect(slider.setValue)
+
         self._fields[key] = slider
-        form.addRow(label, row)
-        
+
+        label_widget = self._make_label_with_info(
+            label, tooltip, handle_color,
+            reset_callback=lambda: slider.setValue(default)
+        )
+        form.addRow(label_widget, row)
+  
     def get_params(self):
         result = {}
         for key, widget in self._fields.items():
@@ -489,6 +638,8 @@ class ParamPanel(QWidget):
                     result[key] = widget.value()
             elif isinstance(widget, QLineEdit):
                 result[key] = widget.text()
+            elif isinstance(widget, QCheckBox):
+                result[key] = widget.isChecked()
 
         checked_levels = [lvl for lvl, cb in self._road_checkboxes.items() if cb.isChecked()]
         result["ROAD_LEVELS"] = checked_levels
@@ -519,6 +670,17 @@ class ParamPanel(QWidget):
 
     def _on_clear_cache(self):
         cache_dir = self._fields["CACHE_DIR"].text()
+        is_empty = not os.path.isdir(cache_dir) or not os.listdir(cache_dir)
+        if not is_empty:
+            confirm = QMessageBox.question(
+                self,
+                "Confirmation",
+                "Effacer tout le cache (DEM, OSM, tuiles) ? Cette action est irréversible.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
         if os.path.isdir(cache_dir):
             shutil.rmtree(cache_dir)
             os.makedirs(cache_dir)
@@ -570,6 +732,20 @@ class ParamPanel(QWidget):
 
         btn_del = QPushButton("✕")
         btn_del.setFixedSize(20, 20)
+        btn_del.setStyleSheet("""
+            QPushButton {
+                background: #4A4A4A;
+                color: #FF6B6B;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background: #FF4444;
+                color: white;
+            }
+        """)
         btn_del.clicked.connect(lambda _, r=row: self._on_remove_gpx(r))
 
         layout.addWidget(cb)

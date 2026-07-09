@@ -37,7 +37,7 @@ class ShapeEditDialog(QDialog):
         self._fields = []
 
         self.setStyleSheet("""
-            QDialog { background: #F8F9FA; }
+            QDialog { background: #2B2B2B; }
             QLabel#header {
                 background: #1971C2; color: white;
                 font-weight: bold; font-size: 13px;
@@ -48,7 +48,8 @@ class ShapeEditDialog(QDialog):
                 border-radius: 5px;
                 padding: 4px 8px;
                 font-size: 12px;
-                background: white;
+                background: black;
+                color: #1971C2;
             }
             QLineEdit:focus { border: 1.5px solid #1971C2; }
             QLabel#index {

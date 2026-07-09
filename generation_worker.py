@@ -1,3 +1,4 @@
+from logger import log
 import os
 import sys
 import math
@@ -5,8 +6,12 @@ import traceback
 import numpy as np
 import trimesh
 from shapely.geometry import Polygon as ShPoly
+import json
+import glob
 
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from monuments_library import get_monument_entry
 
 if 'topopixel' in sys.modules:
     tp = sys.modules['topopixel']
@@ -73,17 +78,12 @@ def build_clip_mask(shape_kind, shape_params, bbox, rows, cols, z_top=None):
     z_bot = -tp.BASE_THICKNESS - 1.0
     if z_top is None:
         z_top = 50.0
-        print("[CLIP] AVERT : z_top par défaut (50.0) utilisé — aucune hauteur de terrain fournie, "
+        log("[CLIP] AVERT : z_top par défaut (50.0) utilisé — aucune hauteur de terrain fournie, "
               "un relief plus haut que 50 sera coupé")
 
     mask_mesh = trimesh.creation.extrude_polygon(poly2d, height=z_top - z_bot)
     mask_mesh.apply_translation([0, 0, z_bot])
     trimesh.repair.fix_normals(mask_mesh)
-
-    print(f"[CLIP] masque {shape_kind} : faces={len(mask_mesh.faces)} watertight={mask_mesh.is_watertight}")
-    print(f"[CLIP] bounds X=[{mask_mesh.bounds[0][0]:.2f},{mask_mesh.bounds[1][0]:.2f}]"
-          f" Y=[{mask_mesh.bounds[0][1]:.2f},{mask_mesh.bounds[1][1]:.2f}]"
-          f" Z=[{mask_mesh.bounds[0][2]:.2f},{mask_mesh.bounds[1][2]:.2f}]")
 
     return mask_mesh
 
@@ -174,6 +174,14 @@ class GenerationWorker(QThread):
                 if "roads" in self.preview_workers and self.preview_workers["roads"].isRunning():
                     self.preview_workers["roads"].wait()
                 road_edges = tp.download_roads(bbox, cache_dir=cache_dir)
+                include_railways = self.ui_params.get("INCLUDE_RAILWAYS", False)
+                if include_railways:
+                    rails = tp.download_railways(bbox, cache_dir=cache_dir)
+                    if rails is not None:
+                        rails = rails.copy()
+                        if "osmid" not in rails.columns:
+                            rails["osmid"] = rails.index.astype(str)
+                        road_edges = pd.concat([road_edges, rails[["geometry", "highway", "osmid"]]], ignore_index=True) if road_edges is not None else rails
             else:
                 road_edges = None
 
@@ -184,7 +192,10 @@ class GenerationWorker(QThread):
                 self._emit("Téléchargement de l'hydrographie OSM...")
                 if "water" in self.preview_workers and self.preview_workers["water"].isRunning():
                     self.preview_workers["water"].wait()
-                water_areas, waterways = tp.download_water(bbox, cache_dir=cache_dir)
+                if "_all" in self.preview_workers and self.preview_workers["_all"].isRunning():
+                    self.preview_workers["_all"].wait()
+                water_areas, waterways, coastlines = tp.download_water(bbox, cache_dir=cache_dir)
+                areas_list = water_areas.geometry.to_crs("EPSG:3857").area.tolist() if water_areas is not None else []
             else:
                 water_areas, waterways = None, None
 
@@ -250,7 +261,7 @@ class GenerationWorker(QThread):
         
             self._emit("Construction des masques...")
             roads_mask = tp.build_roads_mask(road_edges, bbox, elevation.shape, mesh_terrain) if "roads" in enabled else None
-            water_mask = tp.build_water_mask(water_areas, waterways, bbox, elevation.shape, mesh_terrain) if "water" in enabled else None
+            water_mask_lacs, water_mask_ocean = tp.build_water_mask(water_areas, waterways, bbox, elevation.shape, mesh_terrain, z_min, self.ui_params.get("ENABLE_BATHYMETRY", False), elevation) if "water" in enabled else (None, None)
             veg_mask = tp.build_veg_mask(forest, other_veg, bbox, elevation.shape, mesh_terrain) if "vegetation" in enabled else None
             buildings_mask, building_meshes = tp.build_buildings_mask(buildings, bbox, elevation.shape, mesh_terrain) if "buildings" in enabled else (None, [])
             gpx_masks = []
@@ -267,7 +278,8 @@ class GenerationWorker(QThread):
             self._emit("Simplification...")
             mesh_terrain = tp.simplify_mesh(mesh_terrain)
             roads_mask = tp.simplify_mesh(roads_mask) if roads_mask is not None else None
-            water_mask = tp.simplify_mesh(water_mask) if water_mask is not None else None
+            water_mask_lacs = tp.simplify_mesh(water_mask_lacs) if water_mask_lacs is not None else None
+            water_mask_ocean = tp.simplify_mesh(water_mask_ocean) if water_mask_ocean is not None else None
             veg_mask = tp.simplify_mesh(veg_mask) if veg_mask is not None else None
             buildings_mask = tp.simplify_mesh(buildings_mask) if buildings_mask is not None else None
             gpx_masks = [(tp.simplify_mesh(m), c) for m, c in gpx_masks]
@@ -275,21 +287,56 @@ class GenerationWorker(QThread):
             self._emit("Application des booléens...")
             mesh_terrain_pristine = mesh_terrain
             mesh_roads, mesh_terrain = tp.apply_roads_boolean(roads_mask, mesh_terrain, mesh_terrain_pristine) if "roads" in enabled else (trimesh.Trimesh(), mesh_terrain)
-            mesh_water, mesh_terrain = tp.apply_water_boolean(water_mask, mesh_terrain, mesh_terrain_pristine) if "water" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            mesh_water, mesh_terrain = tp.apply_water_boolean(water_mask_lacs, water_mask_ocean, mesh_terrain, mesh_terrain_pristine) if "water" in enabled else (trimesh.Trimesh(), mesh_terrain)
             mesh_veg, mesh_terrain = tp.apply_veg_boolean(veg_mask, mesh_terrain, mesh_terrain_pristine) if "vegetation" in enabled else (trimesh.Trimesh(), mesh_terrain)
             mesh_trees = tp.build_trees_mesh(forest, bbox, elevation.shape, mesh_veg) if "trees" in enabled else trimesh.Trimesh()
-            mesh_buildings, mesh_terrain = tp.apply_buildings_boolean(buildings_mask, building_meshes, mesh_terrain, mesh_terrain_pristine) if "buildings" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            
+            monument_meshes = {}
+            if "buildings" in enabled and building_meshes:
+                z_top_monument = mesh_terrain_pristine.bounds[1][2] + 1.0
+                for building, masque, osm_id, footprint in building_meshes:
+                    entry = get_monument_entry(osm_id)
+                    if entry is None or not entry.get("active", True):
+                        continue
+                    locs = mesh_terrain_pristine.ray.intersects_location(
+                        np.array([[building.centroid[0], building.centroid[1], z_top_monument]]),
+                        np.array([[0, 0, -1]])
+                    )[0]
+                    z_base = locs[:, 2].max() if len(locs) > 0 else 0.0
+                    try:
+                        monument_mesh = tp.build_monument_mesh(entry["stl_path"], entry["rotation_deg"], footprint, z_base, entry.get("scale_factor", 1.0))
+                    except Exception as e:
+                        log(f"[MONUMENT] échec build_monument_mesh : {e}")
+                        monument_mesh = None
+                    log(f"[MONUMENT] monument_mesh={monument_mesh}")
+                    if monument_mesh is not None:
+                        monument_meshes[osm_id] = monument_mesh
+            
+            mesh_buildings, mesh_terrain = tp.apply_buildings_boolean(buildings_mask, building_meshes, mesh_terrain, mesh_terrain_pristine, monument_meshes) if "buildings" in enabled else (trimesh.Trimesh(), mesh_terrain)
+            
+            if len(mesh_buildings.faces) > 0 and len(mesh_roads.faces) > 0:
+                try:
+                    mesh_buildings = trimesh.boolean.difference([mesh_buildings, mesh_roads], engine='manifold')
+                    trimesh.repair.fix_normals(mesh_buildings)
+                except Exception as e:
+                    self._emit(f"  découpe bâtiments/routes échouée : {e}")
             
             mesh_gpx_list = []
             for gpx_mask, gpx_color in gpx_masks:
                 other = {"roads": mesh_roads, "water": mesh_water, "veg": mesh_veg,
                          "buildings": mesh_buildings, "trees": mesh_trees}
+                for i, (prev_mg, _) in enumerate(mesh_gpx_list):
+                    other[f"gpx_{i}"] = prev_mg
                 mg, mesh_terrain, other, failed_cuts = tp.apply_gpx_boolean(gpx_mask, mesh_terrain, mesh_terrain_pristine, other)
                 mesh_roads = other["roads"]
                 mesh_water = other["water"]
                 mesh_veg = other["veg"]
                 mesh_buildings = other["buildings"]
                 mesh_trees = other["trees"]
+                mesh_gpx_list = [
+                    (other[f"gpx_{i}"], color)
+                    for i, (_, color) in enumerate(mesh_gpx_list)
+                ]
                 mesh_gpx_list.append((mg, gpx_color))
                 if failed_cuts:
                     self._emit(f"  ATTENTION : découpe GPX échouée pour {', '.join(failed_cuts)} "
@@ -298,11 +345,14 @@ class GenerationWorker(QThread):
             faces = mesh_terrain.faces
             unique_faces, counts = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
             dup_mask = counts > 1
-            print(f"[TERRAIN] faces dupliquées: {dup_mask.sum()}")
 
             if self.shape_kind != "rect":
                 self._emit("Découpe à la forme...")
-                terrain_z_top = mesh_terrain.bounds[1][2] + 1.0
+                monument_max_z = max(
+                    (m.bounds[1][2] for m in monument_meshes.values()),
+                    default=mesh_terrain.bounds[1][2]
+                )
+                terrain_z_top = max(mesh_terrain.bounds[1][2], monument_max_z) + 1.0
                 clip_mask = build_clip_mask(self.shape_kind, self.shape_params, bbox, rows, cols, z_top=terrain_z_top)
                 if clip_mask is not None and clip_mask.is_watertight:
                     meshes = {
@@ -321,6 +371,7 @@ class GenerationWorker(QThread):
                         try:
                             result = trimesh.boolean.intersection([mesh, clip_mask], engine='manifold')
                             trimesh.repair.fix_normals(result)
+                            components = result.split(only_watertight=False)
                             self._emit(f"  {name} : {len(mesh.faces)} → {len(result.faces)} faces watertight={result.is_watertight}")
                             clipped[name] = result
                         except Exception as e:
@@ -341,6 +392,7 @@ class GenerationWorker(QThread):
                         try:
                             result = trimesh.boolean.intersection([mg, clip_mask], engine='manifold')
                             trimesh.repair.fix_normals(result)
+                            components = result.split(only_watertight=False)
                             self._emit(f"  gpx : {len(mg.faces)} → {len(result.faces)} faces watertight={result.is_watertight}")
                             clipped_gpx_list.append((result, gpx_color))
                         except Exception as e:
@@ -374,10 +426,14 @@ class GenerationWorker(QThread):
                 for mg, c in mesh_gpx_list
             ]
             for mg, _ in mesh_gpx_list:
+                if len(mg.faces) > 0:
+                    components = mg.split(only_watertight=False)
                 mg.apply_transform(scale_matrix)
 
             self._emit("Export des fichiers STL...")
             stl_dir = self.ui_params.get("STL_DIR", "STL")
+            for old_gpx in glob.glob(os.path.join(stl_dir, "terrain_gpx_*.stl")):
+                os.remove(old_gpx)
             files = [
                 "terrain_base.stl", "terrain_roads.stl", "terrain_water.stl",
                 "terrain_vegetation.stl", "terrain_trees.stl", "terrain_buildings.stl",
@@ -397,12 +453,52 @@ class GenerationWorker(QThread):
                 os.path.join(stl_dir, f"{project_name}.3mf"),
                 gpx_list=gpx_list
             )
+            
+            n_puzzle = self.ui_params.get("PUZZLE_N_PIECES", 0)
+            if n_puzzle and n_puzzle >= 2:
+                self._emit(f"Génération puzzle ({n_puzzle} pièces)...")
+                mesh_final = trimesh.util.concatenate([m for m in [
+                    mesh_terrain, mesh_roads, mesh_water, mesh_veg,
+                    mesh_trees, mesh_buildings
+                ] + [m for m, _ in mesh_gpx_list] if len(m.faces) > 0])
+                pieces = tp.build_puzzle_pieces(mesh_final, n_puzzle)
+                if pieces:
+                    puzzle_path = os.path.join(stl_dir, f"{project_name}_puzzle.3mf")
+                    tp.export_puzzle_3mf(pieces, puzzle_path)
+                    self._emit(f"Puzzle exporté : {puzzle_path}")
+
+            layer_stats = tp.compute_layer_stats(road_edges, water_areas, waterways, forest, other_veg, buildings, gpx_list, bbox)
+            base_thickness = self.ui_params.get("BASE_THICKNESS", tp.BASE_THICKNESS)
+
+            pla_density_g_mm3 = 1.24 / 1000
+            mesh_pla = {
+                "terrain": mesh_terrain,
+                "roads": mesh_roads,
+                "water": mesh_water,
+                "vegetation": mesh_veg,
+                "buildings": mesh_buildings,
+            }
+            pla_grams = {}
+            for name, mesh in mesh_pla.items():
+                if len(mesh.faces) > 0 and mesh.is_watertight:
+                    pla_grams[name] = abs(mesh.volume) * pla_density_g_mm3
+                else:
+                    pla_grams[name] = None
+            pla_grams["gpx"] = [
+                abs(mg.volume) * pla_density_g_mm3 if len(mg.faces) > 0 and mg.is_watertight else None
+                for mg, _ in mesh_gpx_list
+            ]
 
             metadata = {
                 "resolution_m": self.ui_params.get("RESOLUTION_M", tp.RESOLUTION_M),
                 "cols": cols,
                 "rows": rows,
                 "scale_mm": scale_mm,
+                "base_thickness_mm": base_thickness * scale_mm,
+                "altitude_min_m": float(elevation.min()),
+                "altitude_max_m": float(elevation.max()),
+                "layer_stats": layer_stats,
+                "pla_grams": pla_grams,
             }
             with open(os.path.join(stl_dir, "metadata.json"), "w") as f:
                 json.dump(metadata, f)

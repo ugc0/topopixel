@@ -1,11 +1,12 @@
 import os
 import numpy as np
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QApplication, QPushButton, QToolButton, QMenu, QWidgetAction
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QApplication, QPushButton, QToolButton, QMenu, QWidgetAction, QScrollArea, QFrame, QToolButton, QMenu, QWidgetAction
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QMouseEvent, QWheelEvent
 import trimesh
 import subprocess
 import glob
+import json
 from datetime import datetime
 from vtkmodules.vtkRenderingCore import (
     vtkRenderer, vtkRenderWindow, vtkActor, vtkPolyDataMapper
@@ -111,6 +112,10 @@ class VtkOffscreenWidget(QLabel):
         super().resizeEvent(event)
         if self._renderer.GetActors().GetNumberOfItems() > 0:
             self.render_to_label()
+        panel = getattr(self.parent(), "_stats_panel", None)
+        if panel is not None:
+            width = min(320, self.width() - 24)
+            panel.setGeometry(12, 56, width, self.height() - 68)
 
     def mousePressEvent(self, event: QMouseEvent):
         self._last_mouse = event.pos()
@@ -181,6 +186,52 @@ class StlViewerPanel(QWidget):
         self._lbl_3mf_date = QLabel("")
         self._lbl_3mf_date.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(self._lbl_3mf_date)
+        
+        self._stats_btn = QPushButton("📊", self._vtk_widget)
+        self._stats_btn.setFixedSize(36, 36)
+        self._stats_btn.setToolTip("Statistiques")
+        self._stats_btn.setStyleSheet("""
+            QPushButton {
+                background: #3C3C3C;
+                color: #DDDDDD;
+                border: 1px solid #555555;
+                border-radius: 18px;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background: #4A4A4A;
+            }
+        """)
+        self._stats_btn.clicked.connect(self._toggle_stats_panel)
+        self._stats_btn.move(12, 12)
+        self._stats_btn.raise_()
+
+        self._stats_panel = QFrame(self._vtk_widget)
+        self._stats_panel.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
+        self._stats_panel.setStyleSheet("""
+            QFrame {
+                background: rgba(43, 43, 43, 235);
+                border: 1px solid #555555;
+                border-radius: 8px;
+            }
+            QLabel {
+                background: transparent;
+                color: #DDDDDD;
+            }
+        """)
+        self._stats_scroll = QScrollArea(self._stats_panel)
+        self._stats_scroll.setWidgetResizable(True)
+        self._stats_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._stats_content = QWidget()
+        self._stats_layout = QVBoxLayout(self._stats_content)
+        self._stats_layout.setContentsMargins(10, 10, 10, 10)
+        self._stats_layout.setSpacing(6)
+        self._stats_scroll.setWidget(self._stats_content)
+        stats_panel_layout = QVBoxLayout(self._stats_panel)
+        stats_panel_layout.setContentsMargins(0, 0, 0, 0)
+        stats_panel_layout.addWidget(self._stats_scroll)
+        self._stats_panel.setVisible(False)
+        self._stats_panel.raise_()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -292,11 +343,18 @@ class StlViewerPanel(QWidget):
         gpx_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         gpx_button.setStyleSheet("""
             QToolButton {
-                background: white;
-                border: none;
-                padding: 2px 8px;
+                background: #3C3C3C;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 2px 22px 2px 8px;
                 font-weight: bold;
-                color: #333333;
+                color: #DDDDDD;
+            }
+            QToolButton:hover { border: 1px solid #888888; }
+            QToolButton::menu-indicator {
+                subcontrol-position: right center;
+                subcontrol-origin: padding;
+                right: 6px;
             }
         """)
         gpx_menu = QMenu(gpx_button)
@@ -362,3 +420,144 @@ class StlViewerPanel(QWidget):
                 QCheckBox::indicator:checked {{ background: rgb({r},{g},{b}); border: 1px solid rgb({r},{g},{b}); }}
                 QCheckBox::indicator:unchecked {{ background: #3C3C3C; border: 1px solid rgb({r},{g},{b}); }}
             """)
+            
+    def _toggle_stats_panel(self):
+        visible = not self._stats_panel.isVisible()
+        self._stats_panel.setVisible(visible)
+        if visible:
+            self._refresh_stats_panel()
+            
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _add_stats_title(self, text):
+        lbl = QLabel(text)  
+        lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #FFFFFF; margin-top: 6px;")
+        self._stats_layout.addWidget(lbl)
+
+    def _add_stats_line(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("font-size: 11px; color: #CCCCCC;")
+        self._stats_layout.addWidget(lbl)
+
+    def _mesh_volume_g(self, mesh):
+        if not mesh.is_watertight:
+            return None
+        volume_mm3 = abs(mesh.volume)
+        return volume_mm3 / 1000 * 1.24
+
+    def _refresh_stats_panel(self):
+        self._clear_layout(self._stats_layout)
+
+        win = self.window()
+        stl_dir = getattr(win, "param_panel", None)
+        stl_dir = stl_dir.get_params().get("STL_DIR", "STL") if stl_dir else "STL"
+
+        metadata_path = os.path.join(stl_dir, "metadata.json")
+        metadata = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+        layer_stats = metadata.get("layer_stats", {})
+        resolution_m = metadata.get("resolution_m")
+        cols = metadata.get("cols")
+        rows = metadata.get("rows")
+
+        scale_mm = metadata.get("scale_mm")
+        if resolution_m and cols and rows:
+            terrain_area_ha = (cols * resolution_m) * (rows * resolution_m) / 10000
+            self._add_stats_title("Échelle")
+            self._add_stats_line(f"Surface réelle : {terrain_area_ha:.2f} ha")
+            if scale_mm:
+                meters_per_cm = 10 * resolution_m / scale_mm
+                self._add_stats_line(f"1 cm = {meters_per_cm:.1f} m")
+
+        terrain_mesh = self._meshes.get("terrain_base.stl")
+        if terrain_mesh is not None and len(terrain_mesh.faces) > 0:
+            bounds = terrain_mesh.bounds
+            base_thickness_mm = metadata.get("base_thickness_mm")
+            self._add_stats_title("Terrain")
+            self._add_stats_line(f"Empreinte : {bounds[1][0]-bounds[0][0]:.1f} x {bounds[1][1]-bounds[0][1]:.1f} mm")
+            if base_thickness_mm is not None:
+                relief_min = 0.0
+                relief_max = bounds[1][2] - bounds[0][2] - base_thickness_mm
+                self._add_stats_line(f"Hauteur relief : {relief_min:.1f} → {relief_max:.1f} mm")
+            altitude_min = metadata.get("altitude_min_m")
+            altitude_max = metadata.get("altitude_max_m")
+            if altitude_min is not None and altitude_max is not None:
+                self._add_stats_line(f"Altitude : {altitude_min:.1f} → {altitude_max:.1f} m")
+            pla_grams = metadata.get("pla_grams", {})
+            g = pla_grams.get("terrain")
+            if g is not None:
+                self._add_stats_line(f"PLA : {g:.1f} g")
+
+            all_bounds_min = []
+            all_bounds_max = []
+            for mesh in self._meshes.values():
+                if len(mesh.faces) > 0:
+                    all_bounds_min.append(mesh.bounds[0][2])
+                    all_bounds_max.append(mesh.bounds[1][2])
+            if all_bounds_min:
+                self._add_stats_title("Maquette")
+                maquette_min = 0.0
+                maquette_max = max(all_bounds_max) - min(all_bounds_min)
+                self._add_stats_line(f"Hauteur maquette : {maquette_min:.1f} → {maquette_max:.1f} mm")
+
+        topic_labels = {
+            "roads": "Routes",
+            "water": "Eau",
+            "vegetation": "Végétation",
+            "buildings": "Bâtiments",
+        }
+        topic_files = {
+            "roads": "terrain_roads.stl",
+            "water": "terrain_water.stl",
+            "vegetation": "terrain_vegetation.stl",
+            "buildings": "terrain_buildings.stl",
+        }
+
+        for topic, label in topic_labels.items():
+            stats = layer_stats.get(topic)
+            if not stats:
+                print(topic,"no stats")
+                continue
+            self._add_stats_title(label)
+            if topic == "roads":
+                self._add_stats_line(f"Segments : {stats['count']}")
+                self._add_stats_line(f"Distance : {stats['distance_m']/1000:.2f} km")
+            elif topic == "water":
+                if "waterway_count" in stats:
+                    self._add_stats_line(f"Cours d'eau : {stats['waterway_count']}")
+                    self._add_stats_line(f"Longueur cours d'eau : {stats['waterway_distance_m']/1000:.2f} km")
+                if "area_count" in stats:
+                    self._add_stats_line(f"Surfaces d'eau : {stats['area_count']}")
+                    self._add_stats_line(f"Surface totale : {stats['area_ha']:.2f} ha")
+            elif topic in ("vegetation", "buildings"):
+                self._add_stats_line(f"Nombre : {stats['count']}")
+                self._add_stats_line(f"Surface : {stats['area_ha']:.2f} ha")
+
+            pla_grams = metadata.get("pla_grams", {})
+            g = pla_grams.get(topic)
+            if g is not None:
+                self._add_stats_line(f"PLA : {g:.1f} g")
+
+        gpx_stats = layer_stats.get("gpx", [])
+        if gpx_stats:
+            self._add_stats_title("GPX")
+            for i, gpx in enumerate(gpx_stats):
+                name = os.path.basename(gpx["path"])
+                if len(name) > 20:
+                    name = name[:17] + "..."
+                self._add_stats_line(f"{name} : {gpx['distance_m']/1000:.2f} km")
+                mesh = self._meshes.get(f"terrain_gpx_{i}.stl")
+                if mesh is not None and len(mesh.faces) > 0:
+                    g = self._mesh_volume_g(mesh)
+                    if g is not None:
+                        self._add_stats_line(f"PLA : {g:.1f} g")
+
+        self._stats_layout.addStretch()

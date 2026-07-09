@@ -1,3 +1,4 @@
+from logger import log
 import os
 import math
 import sys
@@ -5,6 +6,10 @@ import traceback
 import json
 import copy
 import platform
+import base64
+from PyQt6.QtGui import QIcon, QPixmap
+from app_icon import ICON_BASE64
+import ctypes
 
 if platform.system() == "Linux":
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -13,16 +18,16 @@ else:
     os.system("cls")
 
 def excepthook(type, value, tb):
-    print("".join(traceback.format_exception(type, value, tb)))
+    log("".join(traceback.format_exception(type, value, tb)))
 
 sys.excepthook = excepthook
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QLabel, QTextEdit, QMessageBox, QButtonGroup, QRadioButton,
-    QFormLayout, QFrame, QSizePolicy, QTabWidget, QGroupBox, QCheckBox, QGridLayout, QFileDialog, QSpinBox, QDoubleSpinBox, QLineEdit, QSlider
+    QFormLayout, QFrame, QSizePolicy, QTabWidget, QGroupBox, QCheckBox, QGridLayout, QFileDialog, QSpinBox, QDoubleSpinBox, QLineEdit, QSlider, QGraphicsOpacityEffect, QInputDialog
 )
-from PyQt6.QtCore import Qt, qInstallMessageHandler, QTimer
+from PyQt6.QtCore import Qt, qInstallMessageHandler, QTimer, QPropertyAnimation
 from PyQt6.QtGui import QGuiApplication
 
 from map_canvas import MapCanvas
@@ -33,6 +38,7 @@ from preview_worker import PreviewWorker, PreviewWorkerAll
 from overpass_status_widget import OverpassStatusWidget
 from constants import TOPIC_COLORS, checkbox_style
 from shape_edit_dialog import ShapeEditDialog
+from monuments_library import save_monument_entry, set_monument_active, get_monument_entry, set_monument_scale, set_monument_rotation
 import topopixel as tp
 
 RIGHT_PANEL_STYLESHEET = """
@@ -458,7 +464,7 @@ QPushButton:disabled {
         if hasattr(win, 'tabs'):
             win.tabs.setCurrentIndex(1)
         else:
-            print("Tab prévisualisation 3D non trouvé")
+            log("Tab prévisualisation 3D non trouvé")
 
     def _on_failed(self, error_text):
         self._restore_gen_button()
@@ -518,10 +524,13 @@ QPushButton:disabled {
     def _on_stop_preview(self):
         win = self.window()
         if hasattr(win, '_preview_workers'):
-            for worker in win._preview_workers.values():
+            old_workers = list(win._preview_workers.values())
+            for worker in old_workers:
                 if worker.isRunning():
                     worker.terminate()
                     worker.wait()
+            for worker in old_workers:
+                worker.deleteLater()
             win._preview_workers.clear()
         self.reset_preview_status()
         self._btn_stop_preview.setVisible(False)
@@ -581,19 +590,34 @@ class MainWindow(QMainWindow):
         super().__init__()
         
         self.setWindowTitle("Topopixel — Générateur de terrain 3D")
+        icon_data = base64.b64decode(ICON_BASE64)
+        pixmap = QPixmap()
+        pixmap.loadFromData(icon_data)
+        self.setWindowIcon(QIcon(pixmap))
         self.resize(1500, 900)
         self.setStyleSheet("QMainWindow { background-color: #E9ECEF; }")
         
         menubar = self.menuBar()
         projet_menu = menubar.addMenu("Projet")
+        projet_menu.setStyleSheet("QMenu { min-width: 220px; }")
+        
+        action_load = projet_menu.addAction("📂 Charger un projet")
+        action_load.setShortcut("Ctrl+O")
+        action_load.triggered.connect(self._on_load_project)
 
         action_save = projet_menu.addAction("💾 Sauvegarder le projet")
         action_save.setShortcut("Ctrl+S")
         action_save.triggered.connect(self._on_save_project)
 
-        action_load = projet_menu.addAction("📂 Charger un projet")
-        action_load.setShortcut("Ctrl+O")
-        action_load.triggered.connect(self._on_load_project)
+        action_save_as = projet_menu.addAction("💾 Sauvegarder sous...")
+        action_save_as.setShortcut("Ctrl+Alt+S")
+        action_save_as.triggered.connect(self._on_save_project_as)
+        
+        projet_menu.addSeparator()
+        
+        action_quit = projet_menu.addAction("Quitter")
+        action_quit.setShortcut("Ctrl+Q")
+        action_quit.triggered.connect(self._on_quit)
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -646,18 +670,35 @@ class MainWindow(QMainWindow):
         self._preview_worker = None
         self.map_canvas.shape_changed.connect(self._on_shape_changed_preview)
         self.param_panel.road_levels_changed.connect(self._on_road_levels_changed)
+        self.param_panel.railway_option_changed.connect(self._on_railway_option_changed)
         self.param_panel.water_filter_changed.connect(self._on_water_filter_changed)
         self.param_panel.building_filter_changed.connect(self._on_building_filter_changed)
         self.param_panel.color_changed.connect(self._on_color_changed)
-        
-        self.map_canvas.setEnabled(False)
-        self._gen_locked = True
-        
+        self.map_canvas._tooltip.rotation_preview_changed.connect(self.map_canvas.show_monument_rotation_preview)
+        self.map_canvas._tooltip.rotation_committed.connect(self._on_monument_rotation_committed)
+        self.map_canvas._tooltip.scale_committed.connect(self._on_monument_scale_committed)
+        self.map_canvas._tooltip.scale_preview_changed.connect(self.map_canvas.show_monument_scale_preview)
         self._overpass_status.strategy_changed.connect(self._on_overpass_ready)
         self.map_canvas._tooltip.exclusion_changed.connect(self._on_exclusion_changed_count)
         self.param_panel.gpx_changed.connect(self._on_gpx_changed)
         self.param_panel.cache_coverage_toggled.connect(self._on_cache_coverage_toggled)
         self.param_panel.osm_cache_coverage_toggled.connect(self._on_osm_cache_coverage_toggled)
+        self.map_canvas._tooltip.monument_action.connect(self._on_monument_action)
+        self.param_panel.layer_enabled_changed.connect(self._on_layer_enabled_changed)
+        
+        self.map_canvas.setEnabled(False)
+        self._gen_locked = True
+        
+        self._toast = QLabel("", self)
+        self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._toast.hide()
+
+        self._toast_opacity = QGraphicsOpacityEffect(self._toast)
+        self._toast.setGraphicsEffect(self._toast_opacity)
+
+        self._toast_anim = QPropertyAnimation(self._toast_opacity, b"opacity")
+        self._toast_anim.setDuration(400)
+        self._toast_anim.finished.connect(self._on_toast_fade_finished)
         
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -723,10 +764,13 @@ class MainWindow(QMainWindow):
             lats = [p[1] for p in params['points']]
             bbox = {"west": min(lons), "east": max(lons), "south": min(lats), "north": max(lats)}
 
-        for worker in getattr(self, '_preview_workers', {}).values():
+        old_workers = list(getattr(self, '_preview_workers', {}).values())
+        for worker in old_workers:
             if worker.isRunning():
                 worker.terminate()
                 worker.wait()
+        for worker in old_workers:
+            worker.deleteLater()
 
         cache_dir = self.param_panel.get_params().get("CACHE_DIR", "cache")
         self._preview_workers = {}
@@ -752,7 +796,9 @@ class MainWindow(QMainWindow):
             if "roads" in layers_to_preview:
                 self._launch_preview_worker("roads", bbox, cache_dir)
             all_layers = [l for l in layers_to_preview if l != "roads"]
-            if all_layers:
+            if len(all_layers) == 1:
+                self._launch_preview_worker(all_layers[0], bbox, cache_dir)
+            elif all_layers:
                 w = PreviewWorkerAll(bbox, cache_dir=cache_dir)
                 w.ready.connect(self._on_preview_ready)
                 w.failed.connect(lambda l, e: self.right_panel.set_preview_layer_done(l, 0))
@@ -765,7 +811,9 @@ class MainWindow(QMainWindow):
 
     def _launch_preview_worker(self, layer, bbox, cache_dir):
         self.right_panel.set_preview_layer_loading(layer)
-        w = PreviewWorker(layer, bbox, cache_dir=cache_dir)
+        params = self.param_panel.get_params()
+        include_railways = params.get("INCLUDE_RAILWAYS", False)
+        w = PreviewWorker(layer, bbox, cache_dir=cache_dir, include_railways=include_railways)
         w.ready.connect(self._on_preview_ready)
         w.failed.connect(lambda l=layer: (
             self.right_panel.set_preview_layer_done(l, 0),
@@ -795,10 +843,16 @@ class MainWindow(QMainWindow):
 
     def _on_preview_ready(self, layer, data):
         if layer == "roads":
-            visible = self.param_panel.get_params()["ROAD_LEVELS"]
+            params = self.param_panel.get_params()
+            visible = params["ROAD_LEVELS"]
+            if params.get("INCLUDE_RAILWAYS", False):
+                visible = visible + ["railway"]
             self.map_canvas.set_preview_roads(data)
             self.map_canvas.update_preview_visibility(visible)
         elif layer == "water":
+            water_areas = data.get("water_areas")
+            if water_areas is not None:
+                areas = water_areas.geometry.to_crs("EPSG:3857").area.tolist()
             self.map_canvas.set_preview_water(data)
         elif layer == "vegetation":
             self.map_canvas.set_preview_vegetation(data)
@@ -816,9 +870,19 @@ class MainWindow(QMainWindow):
             self.right_panel._btn_stop_preview.setVisible(False)
 
     def _on_road_levels_changed(self):
-        visible = self.param_panel.get_params()["ROAD_LEVELS"]
+        params = self.param_panel.get_params()
+        visible = params["ROAD_LEVELS"]
+        if params.get("INCLUDE_RAILWAYS", False):
+            visible = visible + ["railway"]
         self.map_canvas.update_preview_visibility(visible)
         self.right_panel.set_preview_layer_done("roads", self._count_layer("roads"))
+
+    def _on_railway_option_changed(self):
+        bbox = getattr(self, "_preview_bbox", None)
+        if bbox is None:
+            return
+        cache_dir = getattr(self, "_preview_cache_dir", self.param_panel.get_params().get("CACHE_DIR", "cache"))
+        self._launch_preview_worker("roads", bbox, cache_dir)
 
     def _on_water_filter_changed(self):
         params = self.param_panel.get_params()
@@ -847,9 +911,20 @@ class MainWindow(QMainWindow):
         self._gen_locked = False
 
     def _on_save_project(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Sauvegarder le projet", "", "Projet Topopixel (*.topo)")
+        path = getattr(self, "_current_project_path", None)
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(self, "Sauvegarder le projet", "", "Projet Topopixel (*.topo)")
+            if not path:
+                return
+        self._save_project_to(path)
+
+    def _on_save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Sauvegarder le projet sous", "", "Projet Topopixel (*.topo)")
         if not path:
             return
+        self._save_project_to(path)
+
+    def _save_project_to(self, path):
         lon, lat = self.map_canvas.center_lonlat()
         data = {
             "version": 1,
@@ -863,22 +938,28 @@ class MainWindow(QMainWindow):
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
-            
+
         project_name = os.path.splitext(os.path.basename(path))[0]
         self.setWindowTitle(f"Topopixel — {project_name}")
         self._project_name = project_name
-
+        self._current_project_path = path
+        self.show_toast("Projet sauvegardé")
+    
     def _on_load_project(self):
-        self.map_canvas.clear_shape()
         path, _ = QFileDialog.getOpenFileName(self, "Charger un projet", "", "Projet Topopixel (*.topo)")
         if not path:
             return
+        self.load_project_from_path(path)
+
+    def load_project_from_path(self, path):
+        self.map_canvas.clear_shape()
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
+
         project_name = os.path.splitext(os.path.basename(path))[0]
         self.setWindowTitle(f"Topopixel — {project_name}")
         self._project_name = project_name
+        self._current_project_path = path
 
         m = data.get("map", {})
         self.map_canvas.set_center(m.get("lon", 3.26), m.get("lat", 46.92), m.get("zoom", 14))
@@ -899,6 +980,8 @@ class MainWindow(QMainWindow):
                         widget.setValue(params[key])
                 elif isinstance(widget, QLineEdit):
                     widget.setText(params[key])
+                elif isinstance(widget, QCheckBox):
+                    widget.setChecked(params[key])
 
         road_levels = params.get("ROAD_LEVELS", [])
         for level, cb in self.param_panel._road_checkboxes.items():
@@ -957,6 +1040,47 @@ class MainWindow(QMainWindow):
     def _on_gpx_changed(self):
         self.map_canvas.set_gpx_tracks(self.param_panel.get_gpx_list())
 
+    def _on_layer_enabled_changed(self, layer, is_enabled):
+        if not is_enabled:
+            return
+        preview_layer_map = {"water": "water", "vegetation": "vegetation", "trees": "vegetation", "buildings": "buildings", "roads": "roads"}
+        preview_layer = preview_layer_map.get(layer)
+        if preview_layer is None:
+            return
+        bbox = getattr(self, "_preview_bbox", None)
+        if bbox is None:
+            return
+        cache_dir = getattr(self, "_preview_cache_dir", self.param_panel.get_params().get("CACHE_DIR", "cache"))
+        already_loaded = preview_layer in getattr(self.map_canvas, "_osm_preview_edges", {}) or preview_layer in getattr(self.map_canvas, "_osm_preview_items", {})
+        if already_loaded:
+            return
+        self._launch_preview_worker(preview_layer, bbox, cache_dir)
+
+    def _on_monument_action(self, osm_id, button_text):
+        if button_text == "Remplacer par STL":
+            path, _ = QFileDialog.getOpenFileName(self, "Choisir un STL", "", "STL (*.stl)")
+            if not path:
+                return
+            save_monument_entry(osm_id, path, 0.0, active=True)
+        elif button_text == "Empreinte STL":
+            set_monument_active(osm_id, True)
+        elif button_text == "Empreinte par défaut":
+            set_monument_active(osm_id, False)
+        elif button_text == "Changer STL":
+            path, _ = QFileDialog.getOpenFileName(self, "Choisir un nouveau STL", "", "STL (*.stl)")
+            if not path:
+                return
+            entry = get_monument_entry(osm_id)
+            rotation = entry.get("rotation_deg", 0.0) if entry else 0.0
+            scale = entry.get("scale_factor", 1.0) if entry else 1.0
+            save_monument_entry(osm_id, path, rotation, active=True, scale_factor=scale)
+        elif button_text == "Supprimer STL":
+            from monuments_library import remove_monument_entry
+            remove_monument_entry(osm_id)
+        self.show_toast("Chargement du STL...", color="#F5C518", text_color="#2B2B2B", persistent=True)
+        self.map_canvas.redraw_buildings_preview()
+        self.hide_toast()
+
     def _on_cache_coverage_toggled(self, checked):
         if not checked:
             self.map_canvas.clear_cache_coverage()
@@ -994,6 +1118,59 @@ class MainWindow(QMainWindow):
                 seen.add(key)
                 bboxes.append(parsed)
         self.map_canvas.show_osm_cache_coverage(bboxes)
+        
+    def show_toast(self, text, color="#2F9E44", text_color="white", duration_ms=1600, persistent=False):
+        self._toast.setText(text)
+        self._toast.setStyleSheet(f"""
+            QLabel {{
+                background: {color};
+                color: {text_color};
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+        """)
+        self._toast.adjustSize()
+        x = (self.width() - self._toast.width()) // 2
+        self._toast.move(x, 40)
+        self._toast_opacity.setOpacity(1.0)
+        self._toast.show()
+        self._toast.raise_()
+        QApplication.processEvents()
+        if not persistent:
+            QTimer.singleShot(duration_ms, self._start_toast_fade)
+
+    def hide_toast(self):
+        self._toast.hide()
+
+    def _start_toast_fade(self):
+        self._toast_anim.setStartValue(1.0)
+        self._toast_anim.setEndValue(0.0)
+        self._toast_anim.start()
+
+    def _on_toast_fade_finished(self):
+        if self._toast_opacity.opacity() == 0.0:
+            self._toast.hide()
+
+    def _on_monument_rotation_committed(self, osm_id, rotation_deg):
+        set_monument_rotation(osm_id, rotation_deg)
+        
+    def _on_monument_scale_committed(self, osm_id, scale_factor):
+        set_monument_scale(osm_id, scale_factor)
+        
+    def _on_quit(self):
+        confirm = QMessageBox.question(
+            self,
+            "Quitter",
+            "Voulez-vous sauvegarder le projet avant de quitter ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel
+        )
+        if confirm == QMessageBox.StandardButton.Cancel:
+            return
+        if confirm == QMessageBox.StandardButton.Yes:
+            self._on_save_project()
+        QApplication.quit()
 
 def _qt_message_filter(msg_type, context, message):
     
@@ -1097,21 +1274,39 @@ QListWidget {
     color: #DDDDDD;
     border: 1px solid #555555;
 }
+QToolTip {
+    background-color: #3C3C3C;
+    color: #DDDDDD;
+    border: 1px solid #555555;
+    padding: 4px 8px;
+}
 """
 
 def main():
     qInstallMessageHandler(_qt_message_filter)
-
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-
+    if os.name == "nt":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("topopixel.app")
     app = QApplication(sys.argv)
+    icon_data = base64.b64decode(ICON_BASE64)
+    pixmap = QPixmap()
+    pixmap.loadFromData(icon_data)
+    app.setWindowIcon(QIcon(pixmap))
     app.setStyleSheet(DARK_STYLESHEET)
     win = MainWindow()
     win.show()
+
+    if len(sys.argv) > 1:
+        project_arg = sys.argv[1]
+        if not project_arg.endswith(".topo"):
+            project_arg += ".topo"
+        if os.path.exists(project_arg):
+            win.load_project_from_path(project_arg)
+        else:
+            log(f"Projet introuvable : {project_arg}")
+
     sys.exit(app.exec())
-
-
 if __name__ == "__main__":
     main()

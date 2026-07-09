@@ -1,7 +1,7 @@
 import math
 import json
 import os
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QLabel, QPushButton, QGraphicsLineItem, QGraphicsPolygonItem, QApplication, QLineEdit, QGraphicsProxyWidget, QSpinBox, QListWidget, QListWidgetItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QVBoxLayout, QLabel, QPushButton, QGraphicsLineItem, QGraphicsPolygonItem, QApplication, QLineEdit, QGraphicsProxyWidget, QSpinBox, QListWidget, QListWidgetItem, QSlider, QToolButton, QMenu
 from PyQt6.QtCore import Qt, QRectF, QPointF, QPoint, pyqtSignal, QTimer, QUrl, QUrlQuery
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtGui import (
@@ -10,9 +10,10 @@ from PyQt6.QtGui import (
 )
 from shapely.geometry import Polygon
 import geopandas as gpd
-from tile_manager import TileManager, TILE_SIZE, lonlat_to_tile, tile_to_lonlat
+from tile_manager import TileManager, TILE_SIZE, lonlat_to_tile, tile_to_lonlat, TILE_PROVIDERS, DEFAULT_PROVIDER
 import xml.etree.ElementTree as ET
 
+from monuments_library import get_monument_entry, get_monument_silhouette_2d
 from constants import TOPIC_COLORS
 
 MIN_ZOOM = 2
@@ -28,9 +29,14 @@ PREVIEW_COLORS = {
 class MapTooltip(QWidget):
 
     exclusion_changed = pyqtSignal(object, bool)
+    monument_action = pyqtSignal(str, str)
+    rotation_preview_changed = pyqtSignal(str, float)
+    rotation_committed = pyqtSignal(str, float)
+    scale_preview_changed = pyqtSignal(str, float)
+    scale_committed = pyqtSignal(str, float)
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._excluded_ids = set()
         self._current_data = {}
@@ -46,9 +52,75 @@ class MapTooltip(QWidget):
             QPushButton { background: #4A4A4A; color: #DDDDDD; border: 1px solid #666666; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
             QPushButton:checked { background: #FF4444; color: white; border: 1px solid #FF4444; }
         """)
+        self._monument_btn = QPushButton("Remplacer par STL")
+        self._monument_btn.setStyleSheet("""
+            QPushButton { background: #4A4A4A; color: #DDDDDD; border: 1px solid #666666; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QPushButton:hover { background: #5A5A5A; }
+        """)
+        self._monument_btn.clicked.connect(self._on_monument_clicked)
+
+        self._monument_change_btn = QPushButton("Changer STL")
+        self._monument_change_btn.setStyleSheet("""
+            QPushButton { background: #4A4A4A; color: #4DABF7; border: 1px solid #4DABF7; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QPushButton:hover { background: #3A3A4A; }
+        """)
+        self._monument_change_btn.setVisible(False)
+        self._monument_change_btn.clicked.connect(lambda: self.monument_action.emit(str(self._current_data.get("osm_id", "")), "Changer STL"))
+
+        self._monument_delete_btn = QPushButton("Supprimer STL")
+        self._monument_delete_btn.setStyleSheet("""
+            QPushButton { background: #4A4A4A; color: #FF6B6B; border: 1px solid #FF6B6B; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QPushButton:hover { background: #4A3A3A; }
+        """)
+        self._monument_delete_btn.setVisible(False)
+        self._monument_delete_btn.clicked.connect(lambda: self.monument_action.emit(str(self._current_data.get("osm_id", "")), "Supprimer STL"))
+        
+        rotation_label = QLabel("Rotation : 0°")
+        rotation_label.setStyleSheet("color: #4DABF7; font-size: 10px; font-weight: bold;")
+        rotation_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        rotation_label.mousePressEvent = lambda event: self._reset_rotation()
+        self._rotation_slider = QSlider(Qt.Orientation.Horizontal)
+        self._rotation_slider.setRange(-180, 180)
+        self._rotation_slider.setValue(0)
+        self._rotation_slider.setVisible(False)
+        self._rotation_slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._rotation_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 4px; background: #555555; border-radius: 2px; }
+            QSlider::handle:horizontal { background: #4DABF7; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+        """)
+        self._rotation_slider.valueChanged.connect(self._on_rotation_preview)
+        self._rotation_slider.sliderReleased.connect(self._on_rotation_committed)
+        rotation_label.setVisible(False)
+        self._rotation_label = rotation_label
+        layout.addWidget(self._rotation_label)
+        layout.addWidget(self._rotation_slider)
+
+        scale_label = QLabel("Échelle : x1.0")
+        scale_label.setStyleSheet("color: #FF922B; font-size: 10px; font-weight: bold;")
+        scale_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        scale_label.mousePressEvent = lambda event: self._reset_scale()
+        self._scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self._scale_slider.setRange(50, 200)
+        self._scale_slider.setValue(100)
+        self._scale_slider.setVisible(False)
+        self._scale_slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._scale_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 4px; background: #555555; border-radius: 2px; }
+            QSlider::handle:horizontal { background: #FF922B; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+        """)
+        self._scale_slider.valueChanged.connect(self._on_scale_preview)
+        self._scale_slider.sliderReleased.connect(self._on_scale_committed)
+        scale_label.setVisible(False)
+        self._scale_label = scale_label
+        layout.addWidget(self._scale_label)
+        layout.addWidget(self._scale_slider)
+        
         layout.addWidget(self._title)
         layout.addWidget(self._detail)
         layout.addWidget(self._exclude_btn)
+        layout.addWidget(self._monument_btn)
+        layout.addWidget(self._monument_change_btn)
+        layout.addWidget(self._monument_delete_btn)
         self._exclude_btn.toggled.connect(self._on_exclude_toggled)
 
     def show_data(self, global_pos, osm_id, detail, color, data=None):
@@ -60,6 +132,38 @@ class MapTooltip(QWidget):
         self._exclude_btn.setChecked(excluded)
         self._exclude_btn.setText("Exclu de la génération" if excluded else "Exclure de la génération")
         self._exclude_btn.blockSignals(False)
+
+        is_building = self._current_data.get("type", "") == "buildings"
+        self._monument_btn.setVisible(is_building)
+        entry = get_monument_entry(str(osm_id)) if is_building else None
+        if is_building:
+            if entry is not None:
+                active = entry.get("active", True)
+                self._monument_btn.setText("Empreinte par défaut" if active else "Empreinte STL")
+                self._monument_change_btn.setVisible(True)
+                self._monument_delete_btn.setVisible(True)
+            else:
+                self._monument_btn.setText("Remplacer par STL")
+                self._monument_change_btn.setVisible(False)
+                self._monument_delete_btn.setVisible(False)
+        self._rotation_label.setVisible(entry is not None)
+        self._rotation_slider.setVisible(entry is not None)
+        self._scale_label.setVisible(entry is not None)
+        self._scale_slider.setVisible(entry is not None)
+        if entry is not None:
+            rotation_val = int(entry.get("rotation_deg", 0))
+            scale_val = int(entry.get("scale_factor", 1.0) * 100)
+            self._rotation_slider.blockSignals(True)
+            self._rotation_slider.setValue(rotation_val)
+            self._rotation_slider.blockSignals(False)
+            self._rotation_label.setText(f"Rotation : {rotation_val}°")
+            self._scale_slider.blockSignals(True)
+            self._scale_slider.setValue(scale_val)
+            self._scale_slider.blockSignals(False)
+            self._scale_label.setText(f"Échelle : x{scale_val / 100.0:.2f}")
+            osm_id_str = str(osm_id)
+            self.rotation_preview_changed.emit(osm_id_str, float(rotation_val))
+            self.scale_preview_changed.emit(osm_id_str, scale_val / 100.0)
         self.setStyleSheet(f"""
             QWidget {{
                 background: #000000;
@@ -84,12 +188,41 @@ class MapTooltip(QWidget):
             self._exclude_btn.setText("Exclure de la génération")
         self.exclusion_changed.emit(key, checked)
         
+    def _on_monument_clicked(self):
+        osm_id = str(self._current_data.get("osm_id", ""))
+        self.monument_action.emit(osm_id, self._monument_btn.text())
+        
+    def _on_rotation_preview(self, value):
+        self._rotation_label.setText(f"Rotation : {value}°")
+        osm_id = str(self._current_data.get("osm_id", ""))
+        self.rotation_preview_changed.emit(osm_id, float(value))
+
+    def _on_rotation_committed(self):
+        osm_id = str(self._current_data.get("osm_id", ""))
+        self.rotation_committed.emit(osm_id, float(self._rotation_slider.value()))
+        
+    def _on_scale_preview(self, value):
+        self._scale_label.setText(f"Échelle : x{value / 100.0:.1f}")
+        osm_id = str(self._current_data.get("osm_id", ""))
+        self.scale_preview_changed.emit(osm_id, value / 100.0)
+
+    def _on_scale_committed(self):
+        osm_id = str(self._current_data.get("osm_id", ""))
+        self.scale_committed.emit(osm_id, self._scale_slider.value() / 100.0)
+        
+    def _reset_rotation(self):
+        self._rotation_slider.setValue(0)
+        self._on_rotation_committed()
+
+    def _reset_scale(self):
+        self._scale_slider.setValue(100)
+        self._on_scale_committed()
+        
 class MapCanvas(QGraphicsView):
 
-    shape_changed = pyqtSignal()
-
     REF_ZOOM = 18
-    
+        
+    shape_changed = pyqtSignal()
     item_clicked = pyqtSignal(dict)
 
     def __init__(self, parent=None):
@@ -145,6 +278,7 @@ class MapCanvas(QGraphicsView):
         """)
         self._search_bar.returnPressed.connect(self._on_suggestion_enter)
         self._search_bar.focusOutEvent = self._on_search_focus_out
+        self._search_bar.setVisible(False)
         self._search_nam = QNetworkAccessManager(self)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -196,7 +330,46 @@ class MapCanvas(QGraphicsView):
         self._fit_shape_btn.setVisible(False)
         self._fit_shape_btn.raise_()
         self.setMouseTracking(True)
-        self.shape_changed.connect(self._update_fit_btn_visibility)
+        self.shape_changed.connect(self._update_floating_btn_visibility)
+        
+        self._basemap_button = QToolButton(self)
+        self._basemap_button.setText("🗺")
+        self._basemap_button.setToolTip("Changer le fond de carte")
+        self._basemap_button.setFixedSize(36, 36)
+        self._basemap_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._basemap_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._basemap_button.setStyleSheet("""
+            QToolButton {
+                background: #3C3C3C;
+                color: #DDDDDD;
+                border: 1px solid #555555;
+                border-radius: 18px;
+                font-size: 16px;
+            }
+            QToolButton:hover {
+                background: #4A4A4A;
+            }
+            QToolButton::menu-indicator {
+                image: none;
+            }
+        """)
+        basemap_menu = QMenu(self._basemap_button)
+        basemap_menu.setStyleSheet("""
+            QMenu {
+                background: #3C3C3C;
+                border: 1px solid #555555;
+                color: #DDDDDD;
+            }
+            QMenu::item:selected {
+                background: #555555;
+            }
+        """)
+        for key, info in TILE_PROVIDERS.items():
+            action = basemap_menu.addAction(info["label"])
+            action.triggered.connect(lambda checked, k=key: self._on_basemap_changed(k))
+        self._basemap_button.setMenu(basemap_menu)
+        self._basemap_button.setVisible(False)
+        self._basemap_button.raise_()
 
         self._scale_label = QLabel(self)
         self._scale_label.setStyleSheet("""
@@ -358,7 +531,8 @@ class MapCanvas(QGraphicsView):
 
     def mousePressEvent(self, event: QMouseEvent):
     
-        self._tooltip.hide()
+        if not self._tooltip.isVisible() or not self._tooltip.frameGeometry().contains(event.globalPosition().toPoint()):
+            self._tooltip.hide()
     
         if self._draw_tool is not None:
             self._draw_mouse_press(event)
@@ -505,6 +679,8 @@ class MapCanvas(QGraphicsView):
         self._tooltip.show_data(global_pos, osm_id, detail, color, data)
 
     def _on_focus_changed(self, old, new):
+        if new is not None and (self._tooltip.isAncestorOf(new) or new is self._tooltip):
+            return
         if new is None or not self.window().isAncestorOf(new) and new != self.window():
             self._tooltip.hide()
 
@@ -901,23 +1077,31 @@ class MapCanvas(QGraphicsView):
                 continue
             edges = edges_by_level[level]
             for idx, row in edges.iterrows():
-                geom = row.geometry
-                coords = list(geom.coords)
-                osm_id = osm_id = row["osmid"][0] if isinstance(row["osmid"], list) else row["osmid"]
-                name = row.get("name", "") if "name" in edges.columns else ""
-                for i in range(len(coords) - 1):
-                    lon1, lat1 = coords[i]
-                    lon2, lat2 = coords[i + 1]
-                    p1 = self._lonlat_to_scene(lon1, lat1)
-                    p2 = self._lonlat_to_scene(lon2, lat2)
-                    item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), pen)
-                    item.setZValue(6)
-                    item.setData(0, {"type": "road", "osm_id": osm_id, "name": name, "subtype": level})
-                    if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "road"}:
-                        pen = item.pen()
-                        pen.setColor(QColor("#FF4444"))
-                        item.setPen(pen)
-                    items.append(item)
+                try:
+                    geom = row.geometry
+                    coords = list(geom.coords)
+                    if "osmid" in edges.columns:
+                        osm_id = row["osmid"][0] if isinstance(row["osmid"], list) else row["osmid"]
+                    elif isinstance(idx, tuple):
+                        osm_id = idx[1]
+                    else:
+                        osm_id = idx
+                    name = row.get("name", "") if "name" in edges.columns else ""
+                    for i in range(len(coords) - 1):
+                        lon1, lat1 = coords[i]
+                        lon2, lat2 = coords[i + 1]
+                        p1 = self._lonlat_to_scene(lon1, lat1)
+                        p2 = self._lonlat_to_scene(lon2, lat2)
+                        item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), pen)
+                        item.setZValue(6)
+                        item.setData(0, {"type": "road", "osm_id": osm_id, "name": name, "subtype": level})
+                        if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "road"}:
+                            pen2 = item.pen()
+                            pen2.setColor(QColor("#FF4444"))
+                            item.setPen(pen2)
+                        items.append(item)
+                except Exception as e:
+                    continue
         self._osm_preview_items["roads"] = items
 
     def _draw_osm_preview_water(self, min_area_m2=0, min_length_m=0):
@@ -1075,11 +1259,63 @@ class MapCanvas(QGraphicsView):
                 item.setZValue(5)
                 item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} m²"})
                 if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "buildings"}:
-                    color = QColor("#FF4444")
-                    color.setAlphaF(0.7)
-                    item.setBrush(QBrush(color))
+                    excluded_color = QColor("#FF4444")
+                    excluded_color.setAlphaF(0.7)
+                    item.setBrush(QBrush(excluded_color))
+                else:
+                    monument_entry = get_monument_entry(str(osm_id))
+                    if monument_entry is not None and monument_entry.get("active", True):
+                        item.hide()
+                        silhouette_item = self._build_monument_silhouette_item(item, monument_entry, osm_id, name, subtype)
+                        if silhouette_item is not None:
+                            items.append(silhouette_item)
                 items.append(item)
         self._osm_preview_items["buildings"] = items
+
+    def _build_monument_silhouette_item(self, osm_polygon_item, monument_entry, osm_id, name, subtype):
+        stl_path = monument_entry["stl_path"]
+        try:
+            coords_local = get_monument_silhouette_2d(stl_path)
+            print(f"[SILHOUETTE_DEBUG] osm_id={osm_id} nb_points={len(coords_local)}")
+        except Exception as e:
+            print(f"[SILHOUETTE_DEBUG] échec get_monument_silhouette_2d pour osm_id={osm_id} : {e}")
+            return None
+
+        xs = [c[0] for c in coords_local]
+        ys = [c[1] for c in coords_local]
+        w_stl = max(xs) - min(xs)
+        h_stl = max(ys) - min(ys)
+        stl_area = w_stl * h_stl
+        if stl_area <= 0:
+            return None
+
+        osm_bounds = osm_polygon_item.boundingRect()
+        osm_area_scene = osm_bounds.width() * osm_bounds.height()
+        ratio = math.sqrt(osm_area_scene / stl_area) * monument_entry.get("scale_factor", 1.0)
+
+        cx_stl = (min(xs) + max(xs)) / 2
+        cy_stl = (min(ys) + max(ys)) / 2
+
+        poly = QPolygonF()
+        for x, y in coords_local:
+            poly.append(QPointF((x - cx_stl) * ratio, (y - cy_stl) * ratio))
+
+        pen = QPen(Qt.PenStyle.NoPen)
+        color = QColor("#FF922B")
+        color.setAlphaF(0.7)
+        brush = QBrush(color)
+        item = self._scene.addPolygon(poly, pen, brush)
+        center = osm_bounds.center()
+        item.setPos(center)
+        item.setRotation(monument_entry.get("rotation_deg", 0))
+        item.setZValue(5)
+        item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": ""})
+        return item
+
+    def redraw_buildings_preview(self):
+        for item in self._osm_preview_items.get("buildings", []):
+            self._scene.removeItem(item)
+        self._draw_osm_preview_buildings()
 
     def _shape_as_shapely(self):
         if self._shape_kind is None:
@@ -1121,6 +1357,13 @@ class MapCanvas(QGraphicsView):
         zoom = max(MIN_ZOOM, min(MAX_ZOOM, round(raw_zoom)))
         self.set_center(center_lon, center_lat, zoom)
 
+    def _on_basemap_changed(self, provider_key):
+        self._tile_manager.set_provider(provider_key)
+        for item in self._tile_items.values():
+            self._scene.removeItem(item)
+        self._tile_items.clear()
+        self._refresh_tiles()
+
     def _update_scale_label(self):
         center_lat = self._center_lonlat[1]
         meters_per_pixel = 156543.03392 * math.cos(math.radians(center_lat)) / (2 ** self._current_zoom)
@@ -1134,17 +1377,22 @@ class MapCanvas(QGraphicsView):
         self._scale_label.setFixedWidth(bar_px)
         self._scale_label.move(self.width() - bar_px - 12, self.height() - 20 - 12)
 
-    def _update_fit_btn_visibility(self):
+    def _update_floating_btn_visibility(self):
         self._fit_shape_btn.setVisible(self._shape_kind is not None and self.underMouse())
+        self._basemap_button.setVisible(self.underMouse())
+        self._search_bar.setVisible(self.underMouse())
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        self._update_fit_btn_visibility()
+        self._update_floating_btn_visibility()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
+        if not self._basemap_button.menu().isVisible():
+            self._basemap_button.setVisible(False)
         self._fit_shape_btn.setVisible(False)
-
+        self._search_bar.setVisible(False)
+        
     def get_excluded_ids(self):
         return set(self._tooltip._excluded_ids)
         
@@ -1232,7 +1480,7 @@ class MapCanvas(QGraphicsView):
             self._search_suggestions.setVisible(False)
             self.set_center(float(r["lon"]), float(r["lat"]), 14)
             self._search_bar.clearFocus()
-            elf._search_timer.stop()
+            self._search_timer.stop()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1242,7 +1490,8 @@ class MapCanvas(QGraphicsView):
         self._search_suggestions.setFixedWidth(w)
         self._search_bar.move((self.width() - w) // 2, 12)
         self._search_suggestions.move((self.width() - w) // 2, 12 + 36 + 4)
-        self._fit_shape_btn.move(self.width() - 36 - 12, 12)
+        self._basemap_button.move(self.width() - 36 - 12, 12)
+        self._fit_shape_btn.move(self.width() - 36 - 12, 56)
         self._update_scale_label()
         
     def _on_search_focus_out(self, event):
@@ -1357,3 +1606,24 @@ class MapCanvas(QGraphicsView):
             lon = float(trkpt.attrib['lon'])
             points.append((lon, lat))
         return points
+        
+    def show_monument_rotation_preview(self, osm_id, rotation_deg):
+        for item in self._osm_preview_items.get("buildings", []):
+            data = item.data(0)
+            if data and str(data.get("osm_id")) == osm_id:
+                bounds = item.boundingRect()
+                center = bounds.center()
+                item.setTransformOriginPoint(center)
+                item.setRotation(rotation_deg)
+                self._monument_rotating_item = item
+                break
+                
+    def show_monument_scale_preview(self, osm_id, scale_factor):
+        for item in self._osm_preview_items.get("buildings", []):
+            data = item.data(0)
+            if data and str(data.get("osm_id")) == osm_id:
+                bounds = item.boundingRect()
+                center = bounds.center()
+                item.setTransformOriginPoint(center)
+                item.setScale(scale_factor)
+                break

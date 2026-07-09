@@ -1,5 +1,7 @@
+from logger import log
 from PyQt6.QtCore import QThread, pyqtSignal
 import topopixel as tp
+import pandas as pd
 
 class PreviewWorkerAll(QThread):
     ready = pyqtSignal(str, object)
@@ -23,16 +25,24 @@ class PreviewWorker(QThread):
     ready = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)
 
-    def __init__(self, layer, bbox, cache_dir=None, parent=None):
+    def __init__(self, layer, bbox, cache_dir=None, include_railways=False, parent=None):
         super().__init__(parent)
         self.layer = layer
         self.bbox = bbox
         self.cache_dir = cache_dir or tp.CACHE_DIR
+        self.include_railways = include_railways
 
     def run(self):
         try:
             if self.layer == "roads":
                 edges = tp.download_roads(self.bbox, cache_dir=self.cache_dir)
+                if self.include_railways:
+                    rails = tp.download_railways(self.bbox, cache_dir=self.cache_dir)
+                    if rails is not None:
+                        rails = rails.copy()
+                        if "osmid" not in rails.columns:
+                            rails["osmid"] = rails.index.astype(str)
+                        edges = pd.concat([edges, rails[["geometry", "highway", "osmid"]]], ignore_index=True) if edges is not None else rails
                 if edges is None:
                     self.ready.emit("roads", {})
                     return
@@ -46,8 +56,8 @@ class PreviewWorker(QThread):
                 self.ready.emit("roads", edges_by_level)
 
             elif self.layer == "water":
-                water_areas, waterways = tp.download_water(self.bbox, cache_dir=self.cache_dir)
-                self.ready.emit("water", {"water_areas": water_areas, "waterways": waterways})
+                water_areas, waterways, coastlines = tp.download_water(self.bbox, cache_dir=self.cache_dir)
+                self.ready.emit("water", {"water_areas": water_areas, "waterways": waterways, "coastlines": coastlines})
 
             elif self.layer == "vegetation":
                 forest, other_veg = tp.download_vegetation(self.bbox, cache_dir=self.cache_dir)

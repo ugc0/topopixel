@@ -1,0 +1,14 @@
+{
+  "9596872": {
+    "stl_path": "C:/Users/Ugo/Desktop/python/topopixel/monuments/SOH.stl",
+    "rotation_deg": 20.0,
+    "active": true,
+    "scale_factor": 1.14
+  },
+  "5013364": {
+    "stl_path": "C:/Users/Ugo/Desktop/python/topopixel/monuments/Simple eiffel tower.stl",
+    "rotation_deg": 0.0,
+    "active": true,
+    "scale_factor": 1.0
+  }
+}

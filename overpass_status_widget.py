@@ -42,6 +42,8 @@ class OverpassStatusWidget(QWidget):
         self._btn = QPushButton("⟳")
         self._btn.setFixedSize(24, 24)
         self._btn.setToolTip("Retester les endpoints")
+        self._btn.setObjectName("overpassRefreshBtn")
+        self._btn.setStyleSheet("QPushButton#overpassRefreshBtn { color: #FFFFFF; font-weight: bold; background-color: #3C3C3C; border: 1px solid #666666; padding: 0px; }")
         self._btn.clicked.connect(self.refresh)
         layout.addWidget(self._btn)
         layout.addStretch()

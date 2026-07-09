@@ -1,39 +1,62 @@
 {
   "version": 1,
   "map": {
-    "lon": 151.2294566631317,
-    "lat": -33.8699256010471,
-    "zoom": 13
+    "lon": 3.2626819610595703,
+    "lat": 46.93215460471182,
+    "zoom": 14
   },
-  "shape_kind": "hexagon",
+  "shape_kind": "polygon",
   "shape_params": {
-    "center_lon": 151.20526313781738,
-    "center_lat": -33.86353817877295,
-    "radius_m": 2173.831123875214,
-    "area": 1227.731756610578
+    "area": 1012.8089253608118,
+    "points": [
+      [
+        3.247060775756836,
+        46.93983205320747
+      ],
+      [
+        3.260965347290039,
+        46.91638601150725
+      ],
+      [
+        3.2818222045898438,
+        46.92207261923512
+      ],
+      [
+        3.2671451568603516,
+        46.94534038375875
+      ]
+    ]
   },
   "params": {
     "RESOLUTION_M": 5,
     "SIZE_MM": 120,
     "BASE_THICKNESS": 20,
     "Z_SCALE": 1.0,
+    "PUZZLE_N_PIECES": 16,
+    "INCLUDE_RAILWAYS": false,
     "ROAD_WIDTH_PX": 1,
     "ROAD_HEIGHT": 6,
-    "RIVER_WIDTH_PX": 3,
+    "ROADS_Z_BOT_RATIO_PCT": 33,
+    "RIVER_WIDTH_PX": 1,
     "WATER_HEIGHT": 3,
     "MIN_WATER_AREA_M2": 5000,
     "MIN_WATERWAY_LENGTH_M": 500,
-    "TREE_HEIGHT": 3,
+    "WATER_Z_BOT_RATIO_PCT": 33,
+    "ENABLE_BATHYMETRY": false,
+    "TREE_HEIGHT": 10,
     "TREE_RADIUS": 1,
-    "TREE_DENSITY": 8,
-    "MIN_BUILDING_AREA_M2": 250,
+    "TREE_DENSITY": 15,
+    "VEG_Z_BOT_RATIO_PCT": 90,
+    "MIN_BUILDING_AREA_M2": 230,
     "DEFAULT_BUILDING_HEIGHT_M": 6,
     "METERS_PER_LEVEL": 3,
     "BUILDING_HEIGHT_SCALE": 10,
     "BUILDING_MIN_HEIGHT": 2,
     "BUILDING_MAX_HEIGHT": 20,
-    "GPX_WIDTH_PX": 2,
+    "BUILDINGS_Z_BOT_RATIO_PCT": 90,
+    "GPX_WIDTH_PX": 1,
     "GPX_HEIGHT": 4,
+    "GPX_Z_BOT_RATIO_PCT": 95,
     "CACHE_DIR": "cache",
     "STL_DIR": "STL",
     "GPXZ_API_KEY": "ak_0KtNnPbu_v9orPuogXRYmTu0p",
@@ -43,10 +66,7 @@
       "primary",
       "secondary",
       "tertiary",
-      "unclassified",
       "residential",
-      "living_street",
-      "service",
       "motorway_link",
       "trunk_link",
       "primary_link",
@@ -73,5 +93,11 @@
     "buildings": "#898989",
     "gpx": "#FF0000"
   },
-  "gpx_list": []
+  "gpx_list": [
+    {
+      "path": "C:/Users/Ugo/Downloads/Imphy__SauvignylesBois.gpx",
+      "color": "#FF0000",
+      "enabled": true
+    }
+  ]
 }

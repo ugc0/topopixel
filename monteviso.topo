@@ -1,25 +1,24 @@
 {
   "version": 1,
   "map": {
-    "lon": 151.2294566631317,
-    "lat": -33.8699256010471,
-    "zoom": 13
+    "lon": 7.088069915771484,
+    "lat": 44.68505543499193,
+    "zoom": 12
   },
-  "shape_kind": "hexagon",
+  "shape_kind": "circle",
   "shape_params": {
-    "center_lon": 151.20526313781738,
-    "center_lat": -33.86353817877295,
-    "radius_m": 2173.831123875214,
-    "area": 1227.731756610578
+    "center_lon": 7.079315185546875,
+    "center_lat": 44.680371641890375,
+    "radius_m": 9230.672519293332,
+    "area": 26768.039214854904
   },
   "params": {
-    "RESOLUTION_M": 5,
+    "RESOLUTION_M": 30,
     "SIZE_MM": 120,
     "BASE_THICKNESS": 20,
-    "Z_SCALE": 1.0,
     "ROAD_WIDTH_PX": 1,
     "ROAD_HEIGHT": 6,
-    "RIVER_WIDTH_PX": 3,
+    "RIVER_WIDTH_PX": 1,
     "WATER_HEIGHT": 3,
     "MIN_WATER_AREA_M2": 5000,
     "MIN_WATERWAY_LENGTH_M": 500,
@@ -34,24 +33,22 @@
     "BUILDING_MAX_HEIGHT": 20,
     "GPX_WIDTH_PX": 2,
     "GPX_HEIGHT": 4,
+    "GPXZ_API_KEY": "ak_0KtNnPbu_v9orPuogXRYmTu0p",
     "CACHE_DIR": "cache",
     "STL_DIR": "STL",
-    "GPXZ_API_KEY": "ak_0KtNnPbu_v9orPuogXRYmTu0p",
     "ROAD_LEVELS": [
       "motorway",
       "trunk",
       "primary",
       "secondary",
       "tertiary",
-      "unclassified",
       "residential",
-      "living_street",
-      "service",
       "motorway_link",
       "trunk_link",
       "primary_link",
       "secondary_link",
-      "tertiary_link"
+      "tertiary_link",
+      "residential_link"
     ],
     "ENABLED_LAYERS": [
       "terrain",
@@ -73,5 +70,21 @@
     "buildings": "#898989",
     "gpx": "#FF0000"
   },
-  "gpx_list": []
+  "gpx_list": [
+    {
+      "path": "C:/Users/Ugo/Downloads/tour-du-mont-viso.gpx",
+      "color": "#ff0000",
+      "enabled": true
+    },
+    {
+      "path": "C:/Users/Ugo/Downloads/Anello_dei_Quattro_Laghi_del_Monviso.gpx",
+      "color": "#bc0000",
+      "enabled": true
+    },
+    {
+      "path": "C:/Users/Ugo/Downloads/Giro_del_Monviso_Tappa_3_Rifugio_Vallanta__Rifugio_Quintino_Sella.gpx",
+      "color": "#ff5500",
+      "enabled": true
+    }
+  ]
 }
