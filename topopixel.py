@@ -1332,32 +1332,106 @@ def parse_gpx_file(path, bbox):
             points.append((lon, lat))
     return points
 
-def build_puzzle_pieces(mesh, n_pieces, tolerance=0.2):
-    bounds = mesh.bounds
+def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
+                          tab_right, tab_left, tab_top, tab_bot):
+    r = min(cell_w, cell_h) * 0.14
+    n = 40
+    pts = []
+
+    xc = (cx0 + cx1) / 2
+    if tab_bot is None:
+        pts += [(cx0, cy0), (cx1, cy0)]
+    elif tab_bot:
+        pts += [(cx0, cy0)]
+        for i in range(8): pts.append((cx0 + i/7*(xc-r-cx0), cy0))
+        for i in range(n+1):
+            a = math.pi + math.pi*i/n
+            pts.append((xc + r*math.cos(a), cy0 + r*math.sin(a)))
+        for i in range(8): pts.append((xc+r + i/7*(cx1-(xc+r)), cy0))
+        pts += [(cx1, cy0)]
+    else:
+        pts += [(cx0, cy0)]
+        for i in range(8): pts.append((cx0 + i/7*(xc-r-cx0), cy0))
+        for i in range(n+1):
+            a = -math.pi*i/n
+            pts.append((xc + r*math.cos(a), cy0 + r*math.sin(a)))
+        for i in range(8): pts.append((xc+r + i/7*(cx1-(xc+r)), cy0))
+        pts += [(cx1, cy0)]
+
+    yc = (cy0 + cy1) / 2
+    if tab_right is None:
+        pts += [(cx1, cy1)]
+    elif tab_right:
+        for i in range(8): pts.append((cx1, cy0 + i/7*(yc-r-cy0)))
+        for i in range(n+1):
+            a = -math.pi/2 + math.pi*i/n
+            pts.append((cx1 + r*math.cos(a), yc + r*math.sin(a)))
+        for i in range(8): pts.append((cx1, yc+r + i/7*(cy1-(yc+r))))
+    else:
+        for i in range(8): pts.append((cx1, cy0 + i/7*(yc-r-cy0)))
+        for i in range(n+1):
+            a = -math.pi/2 - math.pi*i/n
+            pts.append((cx1 + r*math.cos(a), yc + r*math.sin(a)))
+        for i in range(8): pts.append((cx1, yc+r + i/7*(cy1-(yc+r))))
+    pts += [(cx1, cy1)]
+
+    xc = (cx0 + cx1) / 2
+    if tab_top is None:
+        pts += [(cx0, cy1)]
+    elif tab_top:
+        for i in range(8): pts.append((cx1 - i/7*(cx1-(xc+r)), cy1))
+        for i in range(n+1):
+            a = math.pi*i/n
+            pts.append((xc + r*math.cos(math.pi - a), cy1 + r*math.sin(math.pi - a)))
+        for i in range(8): pts.append((xc-r - i/7*(xc-r-cx0), cy1))
+        pts += [(cx0, cy1)]
+    else:
+        for i in range(8): pts.append((cx1 - i/7*(cx1-(xc+r)), cy1))
+        for i in range(n+1):
+            a = math.pi*i/n
+            pts.append((xc + r*math.cos(math.pi - a), cy1 - r*math.sin(math.pi - a)))
+        for i in range(8): pts.append((xc-r - i/7*(xc-r-cx0), cy1))
+        pts += [(cx0, cy1)]
+
+    yc = (cy0 + cy1) / 2
+    if tab_left is None:
+        pts += [(cx0, cy0)]
+    elif tab_left:
+        for i in range(8): pts.append((cx0, cy1 - i/7*(cy1-(yc+r))))
+        for i in range(n+1):
+            a = math.pi/2 + math.pi*i/n
+            pts.append((cx0 + r*math.cos(a), yc + r*math.sin(a)))
+        for i in range(8): pts.append((cx0, yc-r - i/7*(yc-r-cy0)))
+        pts += [(cx0, cy0)]
+    else:
+        for i in range(8): pts.append((cx0, cy1 - i/7*(cy1-(yc+r))))
+        for i in range(n+1):
+            a = math.pi/2 - math.pi*i/n
+            pts.append((cx0 + r*math.cos(a), yc + r*math.sin(a)))
+        for i in range(8): pts.append((cx0, yc-r - i/7*(yc-r-cy0)))
+        pts += [(cx0, cy0)]
+
+    from shapely.geometry import Polygon as ShPoly
+    poly = ShPoly(pts)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    return poly
+
+def build_puzzle_pieces(mesh_terrain, n_pieces, extra_meshes=None):
+    bounds = mesh_terrain.bounds
     x_min, y_min = bounds[0][0], bounds[0][1]
     x_max, y_max = bounds[1][0], bounds[1][1]
     z_min, z_max = bounds[0][2], bounds[1][2]
-    z_height = z_max - z_min + 2.0
 
     n_cols = math.ceil(math.sqrt(n_pieces))
     n_rows = math.ceil(n_pieces / n_cols)
 
     cell_w = (x_max - x_min) / n_cols
     cell_h = (y_max - y_min) / n_rows
+    z_height = z_max - z_min + 4.0
 
-    cyl_h = z_height
-
-    def tab_x(x_border, y_center, tol=0.0):
-        r = cell_h * 0.15 + tol
-        cyl = trimesh.creation.cylinder(radius=r, height=cyl_h, sections=32)
-        cyl.apply_translation([x_border + r * 0.8, y_center, (z_min+z_max)/2])
-        return cyl
-
-    def tab_y(x_center, y_border, tol=0.0):
-        r = cell_w * 0.15 + tol
-        cyl = trimesh.creation.cylinder(radius=r, height=cyl_h, sections=32)
-        cyl.apply_translation([x_center, y_border + r * 0.8, (z_min+z_max)/2])
-        return cyl
+    tab_x = {col: (col % 2 == 1) for col in range(1, n_cols)}
+    tab_y = {row: (row % 2 == 1) for row in range(1, n_rows)}
 
     pieces = []
     for row in range(n_rows):
@@ -1370,45 +1444,51 @@ def build_puzzle_pieces(mesh, n_pieces, tolerance=0.2):
             cx1 = cx0 + cell_w
             cy0 = y_min + row * cell_h
             cy1 = cy0 + cell_h
-            yc = (cy0+cy1)/2
-            xc = (cx0+cx1)/2
 
-            cell_box = trimesh.creation.box([cx1-cx0+0.02, cy1-cy0+0.02, z_height])
-            cell_box.apply_translation([(cx0+cx1)/2, (cy0+cy1)/2, (z_min+z_max)/2])
+            right = None if (col == n_cols-1 or idx+1 >= n_pieces) else (not tab_x[col+1])
+            left  = None if col == 0 else tab_x[col]
+            top   = None if (row == n_rows-1 or idx+n_cols >= n_pieces) else (not tab_y[row+1])
+            bot   = None if row == 0 else tab_y[row]
+
+            poly2d = _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
+                                          right, left, top, bot)
+            if poly2d.is_empty or poly2d.area < 1:
+                continue
 
             try:
-                piece = trimesh.boolean.intersection([mesh, cell_box], engine='manifold')
+                mask = trimesh.creation.extrude_polygon(poly2d, height=z_height)
+                mask.apply_translation([0, 0, z_min - 2])
             except Exception as e:
-                log(f"[PUZZLE] découpe pièce ({row},{col}) échouée : {e}")
-                continue
-            if piece is None or len(piece.faces) == 0:
+                log(f"[PUZZLE] masque ({row},{col}) échoué: {e}")
                 continue
 
-            if col < n_cols-1 and (row*n_cols+col+1) < n_pieces:
-                try:
-                    piece = trimesh.boolean.union([piece, tab_x(cx1, yc)], engine='manifold')
-                except Exception as e:
-                    log(f"[PUZZLE] tenon droit ({row},{col}) échoué : {e}")
+            piece_meshes = []
 
-            if col > 0:
-                try:
-                    piece = trimesh.boolean.difference([piece, tab_x(cx0, yc, tol=tolerance)], engine='manifold')
-                except Exception as e:
-                    log(f"[PUZZLE] mortaise gauche ({row},{col}) échouée : {e}")
+            try:
+                terrain_piece = trimesh.boolean.intersection([mesh_terrain, mask], engine='manifold')
+                if terrain_piece is not None and len(terrain_piece.faces) > 0:
+                    if terrain_piece.volume > mesh_terrain.volume * 0.0001:
+                        piece_meshes.append(terrain_piece)
+            except Exception as e:
+                log(f"[PUZZLE] terrain pièce ({row},{col}) échoué: {e}")
+                continue
 
-            if row < n_rows-1 and ((row+1)*n_cols+col) < n_pieces:
-                try:
-                    piece = trimesh.boolean.union([piece, tab_y(xc, cy1)], engine='manifold')
-                except Exception as e:
-                    log(f"[PUZZLE] tenon haut ({row},{col}) échoué : {e}")
+            if not piece_meshes:
+                continue
 
-            if row > 0:
-                try:
-                    piece = trimesh.boolean.difference([piece, tab_y(xc, cy0, tol=tolerance)], engine='manifold')
-                except Exception as e:
-                    log(f"[PUZZLE] mortaise bas ({row},{col}) échouée : {e}")
+            if extra_meshes:
+                for extra in extra_meshes:
+                    if extra is None or len(extra.faces) == 0:
+                        continue
+                    try:
+                        ep = trimesh.boolean.intersection([extra, mask], engine='manifold')
+                        if ep is not None and len(ep.faces) > 0:
+                            piece_meshes.append(ep)
+                    except Exception:
+                        pass
 
-            log(f"[PUZZLE] pièce ({row},{col}) : faces={len(piece.faces)} watertight={piece.is_watertight}")
+            piece = trimesh.util.concatenate(piece_meshes) if len(piece_meshes) > 1 else piece_meshes[0]
+            log(f"[PUZZLE] pièce ({row},{col}): faces={len(piece.faces)} watertight={piece.is_watertight}")
             pieces.append(piece)
 
     return pieces
@@ -1557,6 +1637,7 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
         zf.writestr('[Content_Types].xml', types)
         zf.writestr('Metadata/model_settings.config', '\n'.join(model_settings_lines))
         zf.writestr('Metadata/project_settings.config', filament_settings)
+        zf.writestr('Metadata/filaments_colors.json', filament_settings)
 
     log(f"[3MF] exporté : {output_path}")
 

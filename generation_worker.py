@@ -457,11 +457,10 @@ class GenerationWorker(QThread):
             n_puzzle = self.ui_params.get("PUZZLE_N_PIECES", 0)
             if n_puzzle and n_puzzle >= 2:
                 self._emit(f"Génération puzzle ({n_puzzle} pièces)...")
-                mesh_final = trimesh.util.concatenate([m for m in [
-                    mesh_terrain, mesh_roads, mesh_water, mesh_veg,
-                    mesh_trees, mesh_buildings
-                ] + [m for m, _ in mesh_gpx_list] if len(m.faces) > 0])
-                pieces = tp.build_puzzle_pieces(mesh_final, n_puzzle)
+                extra = [m for m in [mesh_roads, mesh_water, mesh_veg,
+                         mesh_trees, mesh_buildings] + [m for m, _ in mesh_gpx_list]
+                         if m is not None and len(m.faces) > 0]
+                pieces = tp.build_puzzle_pieces(mesh_terrain, n_puzzle, extra_meshes=extra)
                 if pieces:
                     puzzle_path = os.path.join(stl_dir, f"{project_name}_puzzle.3mf")
                     tp.export_puzzle_3mf(pieces, puzzle_path)
