@@ -42,3 +42,24 @@ def color_button_style(color):
         }}
         QPushButton:hover {{ border: 2px solid #000; }}
     """
+    
+def toggle_button_style(color, checked):
+    is_white = color.upper() in ("#FFFFFF", "#FFF")
+    text_color = "#000000" if is_white else "#FFFFFF"
+    bg_color = color if checked else "transparent"
+    border_color = "#000000" if is_white else color
+    label_color = text_color if checked else border_color
+    return f"""
+        QPushButton {{
+            background: {bg_color};
+            color: {label_color};
+            border: 2px solid {border_color};
+            border-radius: 4px;
+            font-weight: bold;
+            padding: 4px 6px;
+            text-align: left;
+        }}
+        QPushButton:hover {{
+            border: 2px solid {border_color};
+        }}
+    """

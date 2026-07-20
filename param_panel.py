@@ -278,6 +278,7 @@ class ParamPanel(QWidget):
         layout.setSpacing(4)
 
         self._fields = {}
+        self._options_provider = None
 
         layout.addWidget(self._build_general_group())
         layout.addWidget(self._build_roads_group())
@@ -285,7 +286,6 @@ class ParamPanel(QWidget):
         layout.addWidget(self._build_vegetation_group())
         layout.addWidget(self._build_buildings_group())
         layout.addWidget(self._build_gpx_group())
-        layout.addWidget(self._build_advanced_group())
 
         layout.addStretch(1)
         
@@ -295,8 +295,6 @@ class ParamPanel(QWidget):
     building_filter_changed = pyqtSignal()
     color_changed = pyqtSignal(str, str)
     gpx_changed = pyqtSignal()
-    cache_coverage_toggled = pyqtSignal(bool)
-    osm_cache_coverage_toggled = pyqtSignal(bool)
     layer_enabled_changed = pyqtSignal(str, bool)
 
     def _build_general_group(self):
@@ -304,7 +302,6 @@ class ParamPanel(QWidget):
         form = section.form()
 
         self._add_int(form, "RESOLUTION_M", "Résolution DEM (m/px)", 5, 1, 30, tooltip=TOOLTIPS.get("RESOLUTION_M"))
-        self._fields["RESOLUTION_M"].valueChanged.connect(lambda: self.cache_coverage_toggled.emit(self._btn_cache_coverage.isChecked()))
         self._add_int(form, "SIZE_MM", "Taille impression (mm)", 120, 10, 500, 1, tooltip=TOOLTIPS.get("SIZE_MM"))
         self._add_int(form, "BASE_THICKNESS", "Épaisseur socle", 20, 1, 200, 1, tooltip=TOOLTIPS.get("BASE_THICKNESS"))
         self._add_double(form, "Z_SCALE", "Exagération verticale", 1.0, 0.1, 5.0, 0.1, tooltip=TOOLTIPS.get("Z_SCALE"))
@@ -509,46 +506,6 @@ class ParamPanel(QWidget):
 
         return section
 
-    def _build_advanced_group(self):
-        section = CollapsibleSection(
-            "Avancé", accent="#9C36B5", expanded=False,
-            hint="Gestion du cache et clé API"
-        )
-        form = section.form()
-
-        cache_dir = QLineEdit("cache")
-        self._fields["CACHE_DIR"] = cache_dir
-        form.addRow("Dossier cache DEM", cache_dir)
-        
-        stl_dir = QLineEdit("STL")
-        self._fields["STL_DIR"] = stl_dir
-        form.addRow("Dossier STL", stl_dir)
-        
-        form.addRow(QLabel("Gestion du cache"))
-        self._btn_clear_cache = QPushButton("Effacer le cache (calcul en cours...)")
-        self._btn_clear_cache.clicked.connect(self._on_clear_cache)
-        form.addRow(self._btn_clear_cache)
-        self._update_cache_size()
-
-        self._btn_cache_coverage = QPushButton("Afficher couverture cache DEM")
-        self._btn_cache_coverage.setCheckable(True)
-        self._btn_cache_coverage.setChecked(False)
-        self._btn_cache_coverage.toggled.connect(self.cache_coverage_toggled.emit)
-        form.addRow(self._btn_cache_coverage)
-
-        self._btn_osm_cache_coverage = QPushButton("Afficher couverture cache OSM")
-        self._btn_osm_cache_coverage.setCheckable(True)
-        self._btn_osm_cache_coverage.setChecked(False)
-        self._btn_osm_cache_coverage.toggled.connect(self.osm_cache_coverage_toggled.emit)
-        form.addRow(self._btn_osm_cache_coverage)
-        
-        gpxz_key = QLineEdit("ak_0KtNnPbu_v9orPuogXRYmTu0p")
-        gpxz_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._fields["GPXZ_API_KEY"] = gpxz_key
-        form.addRow("Clé API GPXZ", gpxz_key)
-
-        return section
-
     def _make_label_with_info(self, label, tooltip, handle_color="#FFFFFF", reset_callback=None):
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -645,47 +602,11 @@ class ParamPanel(QWidget):
         result["ROAD_LEVELS"] = checked_levels
         result["ENABLED_LAYERS"] = [k for k, cb in self._layer_checkboxes.items() if cb.isChecked()]
 
+        if self._options_provider is not None:
+            result.update(self._options_provider.get_values())
+
         return result
-        
-    def _get_cache_size(self):
-        cache_dir = self._fields["CACHE_DIR"].text()
-        if not os.path.isdir(cache_dir):
-            return 0
-        total = 0
-        for dirpath, _, filenames in os.walk(cache_dir):
-            for f in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, f))
-                except:
-                    pass
-        return total
 
-    def _update_cache_size(self):
-        size = self._get_cache_size()
-        if size < 1024 * 1024:
-            label = f"{size // 1024} Ko"
-        else:
-            label = f"{size / (1024*1024):.1f} Mo"
-        self._btn_clear_cache.setText(f"Effacer le cache ({label})")
-
-    def _on_clear_cache(self):
-        cache_dir = self._fields["CACHE_DIR"].text()
-        is_empty = not os.path.isdir(cache_dir) or not os.listdir(cache_dir)
-        if not is_empty:
-            confirm = QMessageBox.question(
-                self,
-                "Confirmation",
-                "Effacer tout le cache (DEM, OSM, tuiles) ? Cette action est irréversible.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                return
-        if os.path.isdir(cache_dir):
-            shutil.rmtree(cache_dir)
-            os.makedirs(cache_dir)
-        self._update_cache_size()
-        
     def _on_pick_color(self, key, btn, cb):
         dialog = QColorDialog(QColor(TOPIC_COLORS.get(key, "#888888")), self)
         dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
@@ -785,3 +706,6 @@ class ParamPanel(QWidget):
         for row, cb, lbl, btn in self._gpx_entries:
             row.deleteLater()
         self._gpx_entries = []
+        
+    def set_options_provider(self, provider):
+        self._options_provider = provider

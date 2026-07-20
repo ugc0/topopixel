@@ -4,7 +4,7 @@ import math
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import Qt, QUrl
 
 TILE_SIZE = 256
 TILE_CACHE_DIR = "tile_cache"
@@ -29,6 +29,10 @@ TILE_PROVIDERS = {
     "satellite": {
         "label": "Satellite (Esri)",
         "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    },
+    "blank": {
+        "label": "Fond blanc",
+        "url": None,
     },
 }
 DEFAULT_PROVIDER = "osm"
@@ -80,7 +84,17 @@ class TileManager(QObject):
             return
         x = x % n
 
+        if TILE_PROVIDERS[self._provider].get("url") is None:
+            key = (self._provider, z, x, y)
+            if key not in self._mem_cache:
+                pix = QPixmap(TILE_SIZE, TILE_SIZE)
+                pix.fill(Qt.GlobalColor.white)
+                self._store_mem(key, pix)
+            self.tile_ready.emit(z, x, y, self._mem_cache[key])
+            return
+
         key = (self._provider, z, x, y)
+        
         if key in self._mem_cache:
             self.tile_ready.emit(z, x, y, self._mem_cache[key])
             return

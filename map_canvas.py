@@ -1,3 +1,4 @@
+from logger import log
 import math
 import json
 import os
@@ -39,6 +40,7 @@ class MapTooltip(QWidget):
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._excluded_ids = set()
+        self._excluded_fill_features = []
         self._current_data = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -179,6 +181,7 @@ class MapTooltip(QWidget):
     def _on_exclude_toggled(self, checked):
         osm_id = str(self._current_data.get("osm_id", ""))
         layer_type = self._current_data.get("type", "")
+        source = self._current_data.get("source", "")
         key = (layer_type, osm_id)
         if checked:
             self._excluded_ids.add(key)
@@ -186,8 +189,22 @@ class MapTooltip(QWidget):
         else:
             self._excluded_ids.discard(key)
             self._exclude_btn.setText("Exclure de la génération")
+
+        if source in ("landcover", "satellite"):
+            lat = self._current_data.get("lat")
+            lon = self._current_data.get("lon")
+            if lat is not None and lon is not None:
+                self._excluded_fill_features = [
+                    f for f in self._excluded_fill_features
+                    if not (f["type"] == layer_type and f["source"] == source and f["osm_id"] == osm_id)
+                ]
+                if checked:
+                    self._excluded_fill_features.append({
+                        "type": layer_type, "source": source, "osm_id": osm_id, "lat": lat, "lon": lon,
+                    })
+
         self.exclusion_changed.emit(key, checked)
-        
+    
     def _on_monument_clicked(self):
         osm_id = str(self._current_data.get("osm_id", ""))
         self.monument_action.emit(osm_id, self._monument_btn.text())
@@ -411,24 +428,42 @@ class MapCanvas(QGraphicsView):
 
         self.set_center(*self._center_lonlat, self._current_zoom)
         
+    def set_preview_fill_visible(self, target_layer, source, visible):
+        for key, items in getattr(self, "_fill_preview_items", {}).items():
+            if key[0] != target_layer or key[1] != source:
+                continue
+            for item in items:
+                item.setVisible(visible)
+        
     def _on_exclusion_changed(self, key, excluded):
         layer_type, osm_id = key
+        color = QColor("#FF4444") if excluded else QColor(PREVIEW_COLORS.get(layer_type, "#000000"))
+
         for layer, layer_items in self._osm_preview_items.items():
             for item in layer_items:
                 data = item.data(0)
                 if not data or data.get("type") != layer_type or str(data.get("osm_id")) != osm_id:
                     continue
-                if excluded:
-                    color = QColor("#FF4444")
-                else:
-                    color = QColor(PREVIEW_COLORS.get(layer_type, "#000000"))
                 if isinstance(item, QGraphicsLineItem):
                     pen = item.pen()
                     pen.setColor(color)
                     item.setPen(pen)
                 elif isinstance(item, QGraphicsPolygonItem):
-                    color.setAlphaF(0.7)
-                    item.setBrush(QBrush(color))
+                    fill_color = QColor(color)
+                    fill_color.setAlphaF(0.7)
+                    item.setBrush(QBrush(fill_color))
+
+        for fkey, layer_items in getattr(self, "_fill_preview_items", {}).items():
+            target_layer, source = fkey
+            if target_layer != layer_type:
+                continue
+            for item in layer_items:
+                data = item.data(0)
+                if not data or str(data.get("osm_id")) != osm_id:
+                    continue
+                fill_color = QColor(color)
+                fill_color.setAlphaF(0.7 if excluded else 0.5)
+                item.setBrush(QBrush(fill_color))
 
     def _lonlat_to_scene(self, lon, lat):
         tx, ty = lonlat_to_tile(lon, lat, self.REF_ZOOM)
@@ -533,6 +568,13 @@ class MapCanvas(QGraphicsView):
     
         if not self._tooltip.isVisible() or not self._tooltip.frameGeometry().contains(event.globalPosition().toPoint()):
             self._tooltip.hide()
+            
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_start = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
     
         if self._draw_tool is not None:
             self._draw_mouse_press(event)
@@ -612,6 +654,21 @@ class MapCanvas(QGraphicsView):
             event.accept()
             return
     
+        if self._panning:
+            delta = event.position() - self._pan_start
+            self._pan_start = event.position()
+
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - int(delta.x())
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - int(delta.y())
+            )
+
+            self._refresh_tiles()
+            event.accept()
+            return
+
         if self._draw_tool is not None:
             self._draw_mouse_move(event)
             return
@@ -658,6 +715,12 @@ class MapCanvas(QGraphicsView):
             event.accept()
             return
             
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+            
         if event.button() == Qt.MouseButton.LeftButton:
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -675,6 +738,17 @@ class MapCanvas(QGraphicsView):
         color = PREVIEW_COLORS.get(data.get("type", ""), "#000000")
         osm_id = str(data.get("osm_id", ""))
         detail = data.get("subtype", "") if data.get("type") == "road" else data.get("detail", "")
+
+        source_key = data.get("source", "osm")
+        source_label = {
+            "osm": "OpenStreetMap",
+            "landcover": "Copernicus LCFM",
+            "satellite": "Satellite Sentinel-2",
+        }.get(source_key, source_key)
+
+        if source_key == "osm":
+            detail = f"{detail} — Source : {source_label}" if detail else f"Source : {source_label}"
+
         global_pos = self.mapToGlobal(pos)
         self._tooltip.show_data(global_pos, osm_id, detail, color, data)
 
@@ -996,6 +1070,70 @@ class MapCanvas(QGraphicsView):
             min_area = win.param_panel.get_params().get("MIN_BUILDING_AREA_M2", 0)
         self._draw_osm_preview_buildings(min_area_m2=min_area)
 
+    def set_preview_fill(self, target_layer, source, features):
+        if not hasattr(self, "_fill_preview_items"):
+            self._fill_preview_items = {}
+        key = (target_layer, source)
+        for item in self._fill_preview_items.get(key, []):
+            self._scene.removeItem(item)
+
+        color_hex = PREVIEW_COLORS.get(target_layer, "#888888")
+        color = QColor(color_hex)
+        color.setAlphaF(0.5)
+        pen = QPen(Qt.PenStyle.NoPen)
+        brush = QBrush(color)
+
+        items = []
+        for feature in features:
+            geom = feature["geometry"]
+            parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+            for part in parts:
+                poly = QPolygonF()
+                for lon, lat in part.exterior.coords:
+                    p = self._lonlat_to_scene(lon, lat)
+                    poly.append(p)
+                item = self._scene.addPolygon(poly, pen, brush)
+                item.setZValue(4)
+                
+                source_label = {"landcover": "Copernicus LCFM", "satellite": "Satellite Sentinel-2"}.get(feature["source"], feature["source"])
+                rep = part.convex_hull.centroid
+
+                area_m2 = gpd.GeoSeries([part], crs="EPSG:4326").to_crs("EPSG:3857").area.iloc[0]
+                if target_layer == "buildings":
+                    area_str = f"{round(area_m2)} m²"
+                else:
+                    area_str = f"{area_m2 / 10000:.2f} ha"
+
+                item.setData(0, {
+                    "type": target_layer, "osm_id": feature["id"], "name": "",
+                    "subtype": feature["source"], "detail": f"{area_str} — Source : {source_label}", "source": feature["source"],
+                    "lat": rep.y, "lon": rep.x,
+                })
+                
+                if (target_layer, str(feature["id"])) in self._tooltip._excluded_ids:
+                    excl_color = QColor("#FF4444")
+                    excl_color.setAlphaF(0.7)
+                    item.setBrush(QBrush(excl_color))
+                items.append(item)
+
+        self._fill_preview_items[key] = items
+
+    def clear_preview_fill(self, target_layer=None, source=None):
+        if not hasattr(self, "_fill_preview_items"):
+            self._fill_preview_items = {}
+            return
+        if target_layer is None:
+            for layer_items in self._fill_preview_items.values():
+                for item in layer_items:
+                    self._scene.removeItem(item)
+            self._fill_preview_items = {}
+            return
+        keys = [k for k in self._fill_preview_items if k[0] == target_layer and (source is None or k[1] == source)]
+        for key in keys:
+            for item in self._fill_preview_items[key]:
+                self._scene.removeItem(item)
+            self._fill_preview_items[key] = []
+
     def update_preview_visibility(self, visible_levels: list):
         self._clear_osm_preview("roads")
         self._draw_osm_preview_roads(visible_levels)
@@ -1060,6 +1198,46 @@ class MapCanvas(QGraphicsView):
         for item in getattr(self, "_cache_coverage_items", []):
             self._scene.removeItem(item)
         self._cache_coverage_items = []
+        
+    def show_landcover_cache_coverage(self, bboxes):
+        self.clear_landcover_cache_coverage()
+        pen = QPen(QColor(46, 139, 87, 200))
+        pen.setWidth(2)
+        brush = QBrush(QColor(46, 139, 87, 60))
+        items = []
+        for bbox in bboxes:
+            top_left = self._lonlat_to_scene(bbox["west"], bbox["north"])
+            bottom_right = self._lonlat_to_scene(bbox["east"], bbox["south"])
+            rect = QRectF(top_left, bottom_right)
+            item = self._scene.addRect(rect, pen, brush)
+            item.setZValue(5)
+            items.append(item)
+        self._landcover_cache_coverage_items = items
+
+    def clear_landcover_cache_coverage(self):
+        for item in getattr(self, "_landcover_cache_coverage_items", []):
+            self._scene.removeItem(item)
+        self._landcover_cache_coverage_items = []
+
+    def show_satellite_cache_coverage(self, bboxes):
+        self.clear_satellite_cache_coverage()
+        pen = QPen(QColor(155, 89, 182, 200))
+        pen.setWidth(2)
+        brush = QBrush(QColor(155, 89, 182, 60))
+        items = []
+        for bbox in bboxes:
+            top_left = self._lonlat_to_scene(bbox["west"], bbox["north"])
+            bottom_right = self._lonlat_to_scene(bbox["east"], bbox["south"])
+            rect = QRectF(top_left, bottom_right)
+            item = self._scene.addRect(rect, pen, brush)
+            item.setZValue(5)
+            items.append(item)
+        self._satellite_cache_coverage_items = items
+
+    def clear_satellite_cache_coverage(self):
+        for item in getattr(self, "_satellite_cache_coverage_items", []):
+            self._scene.removeItem(item)
+        self._satellite_cache_coverage_items = []
 
     def _clear_osm_preview(self, layer: str):
         for item in self._osm_preview_items.get(layer, []):
@@ -1094,7 +1272,7 @@ class MapCanvas(QGraphicsView):
                         p2 = self._lonlat_to_scene(lon2, lat2)
                         item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), pen)
                         item.setZValue(6)
-                        item.setData(0, {"type": "road", "osm_id": osm_id, "name": name, "subtype": level})
+                        item.setData(0, {"type": "road", "osm_id": osm_id, "name": name, "subtype": level, "source": "osm"})
                         if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "road"}:
                             pen2 = item.pen()
                             pen2.setColor(QColor("#FF4444"))
@@ -1138,7 +1316,7 @@ class MapCanvas(QGraphicsView):
                         poly.append(p)
                     item = self._scene.addPolygon(poly, pen, brush)
                     item.setZValue(5)
-                    item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_m2} m²"})
+                    item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_m2} m²", "source": "osm"})
                     if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "water"}:
                         color = QColor("#FF4444")
                         color.setAlphaF(0.7)
@@ -1177,7 +1355,7 @@ class MapCanvas(QGraphicsView):
                     p2 = self._lonlat_to_scene(lon2, lat2)
                     item = self._scene.addLine(p1.x(), p1.y(), p2.x(), p2.y(), line_pen)
                     item.setZValue(5)
-                    item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{length_m} m"})
+                    item.setData(0, {"type": "water", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{length_m} m", "source": "osm"})
                     if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "water"}:
                         pen = item.pen()
                         pen.setColor(QColor("#FF4444"))
@@ -1215,7 +1393,7 @@ class MapCanvas(QGraphicsView):
                         poly.append(p)
                     item = self._scene.addPolygon(poly, pen, brush)
                     item.setZValue(5)
-                    item.setData(0, {"type": "vegetation", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} ha"})
+                    item.setData(0, {"type": "vegetation", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} ha", "source": "osm"})
                     if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "vegetation"}:
                         color = QColor("#FF4444")
                         color.setAlphaF(0.7)
@@ -1257,7 +1435,7 @@ class MapCanvas(QGraphicsView):
                     poly.append(p)
                 item = self._scene.addPolygon(poly, pen, brush)
                 item.setZValue(5)
-                item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} m²"})
+                item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": f"{area_ha} m²", "source": "osm"})
                 if str(osm_id) in {oid for t, oid in self._tooltip._excluded_ids if t == "buildings"}:
                     excluded_color = QColor("#FF4444")
                     excluded_color.setAlphaF(0.7)
@@ -1309,7 +1487,7 @@ class MapCanvas(QGraphicsView):
         item.setPos(center)
         item.setRotation(monument_entry.get("rotation_deg", 0))
         item.setZValue(5)
-        item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": ""})
+        item.setData(0, {"type": "buildings", "osm_id": osm_id, "name": name, "subtype": subtype, "detail": "", "source": "osm"})
         return item
 
     def redraw_buildings_preview(self):

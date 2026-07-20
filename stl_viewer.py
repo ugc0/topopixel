@@ -1,6 +1,7 @@
 import os
+import re
 import numpy as np
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QApplication, QPushButton, QToolButton, QMenu, QWidgetAction, QScrollArea, QFrame, QToolButton, QMenu, QWidgetAction
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QApplication, QPushButton, QToolButton, QMenu, QWidgetAction, QScrollArea, QFrame, QToolButton, QMenu, QWidgetAction, QSlider
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QMouseEvent, QWheelEvent
 import trimesh
@@ -24,6 +25,20 @@ LAYER_COLORS = {
     "terrain_vegetation.stl": ("#00D921", "Végétation"),
     "terrain_trees.stl":      ("#006921", "Arbres"),
     "terrain_buildings.stl":  ("#898989", "Bâtiments"),
+}
+
+PUZZLE_LAYER_COLORS = {
+    "terrain":    "#FFFFFF",
+    "roads":      "#000000",
+    "water":      "#0094FF",
+    "vegetation": "#00D921",
+    "trees":      "#006921",
+    "buildings":  "#898989",
+}
+
+PUZZLE_LAYER_LABELS = {
+    "terrain": "Terrain", "roads": "Routes", "water": "Eau",
+    "vegetation": "Végétation", "trees": "Arbres", "buildings": "Bâtiments",
 }
 
 def hex_to_rgb(hex_color):
@@ -55,7 +70,6 @@ def trimesh_to_vtk_actor(mesh, hex_color):
     actor.GetProperty().SetColor(r/255, g/255, b/255)
     actor.GetProperty().SetOpacity(1.0)
     return actor
-
 
 class VtkOffscreenWidget(QLabel):
     def __init__(self, parent=None):
@@ -205,7 +219,7 @@ class StlViewerPanel(QWidget):
         self._stats_btn.clicked.connect(self._toggle_stats_panel)
         self._stats_btn.move(12, 12)
         self._stats_btn.raise_()
-
+        
         self._stats_panel = QFrame(self._vtk_widget)
         self._stats_panel.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
         self._stats_panel.setStyleSheet("""
@@ -232,6 +246,33 @@ class StlViewerPanel(QWidget):
         stats_panel_layout.addWidget(self._stats_scroll)
         self._stats_panel.setVisible(False)
         self._stats_panel.raise_()
+        
+        self._explode_widget = QFrame(self._vtk_widget)
+        self._explode_widget.setStyleSheet("""
+            QFrame {
+                background: rgba(43, 43, 43, 235);
+                border: 1px solid #555555;
+                border-radius: 8px;
+            }
+            QLabel { background: transparent; color: #DDDDDD; }
+        """)
+        explode_layout = QHBoxLayout(self._explode_widget)
+        explode_layout.setContentsMargins(10, 6, 10, 6)
+        explode_label = QLabel("Éclatement")
+        self._explode_slider = QSlider(Qt.Orientation.Horizontal)
+        self._explode_slider.setRange(0, 20)
+        self._explode_slider.setValue(10)
+        self._explode_slider.setFixedWidth(120)
+        self._explode_value_lbl = QLabel("1.00")
+        self._explode_value_lbl.setStyleSheet("min-width: 32px;")
+        self._explode_slider.valueChanged.connect(self._on_explode_changed)
+        explode_layout.addWidget(explode_label)
+        explode_layout.addWidget(self._explode_slider)
+        explode_layout.addWidget(self._explode_value_lbl)
+        self._explode_widget.move(12, 60)
+        self._explode_widget.adjustSize()
+        self._explode_widget.setVisible(False)
+        self._explode_widget.raise_()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -248,8 +289,32 @@ class StlViewerPanel(QWidget):
     def reload_stl_folder(self, folder="STL"):
         self._meshes.clear()
         self._actors.clear()
+        self._layer_groups = None
         self._vtk_widget.remove_all_actors()
+        self._explode_widget.setVisible(False)
 
+        puzzle_files = sorted(glob.glob(os.path.join(folder, "puzzle_piece*_*.stl")))
+        if puzzle_files:
+            self._load_puzzle(folder, puzzle_files)
+        else:
+            self._load_standard(folder)
+
+        self._vtk_widget.reset_camera()
+        self._vtk_widget.render_to_label()
+        self._rebuild_checkboxes()
+
+        project_name = "topopixel"
+        win = self.window()
+        if hasattr(win, '_project_name'):
+            project_name = win._project_name
+        mf = os.path.join(folder, f"{project_name}.3mf")
+        if os.path.exists(mf):
+            t = datetime.fromtimestamp(os.path.getmtime(mf))
+            self._lbl_3mf_date.setText(f"3MF généré le {t.strftime('%d/%m/%Y %H:%M')}")
+        else:
+            self._lbl_3mf_date.setText("")
+    
+    def _load_standard(self, folder):
         for fname, (color_hex, label) in LAYER_COLORS.items():
             path = os.path.join(folder, fname)
             if not os.path.exists(path):
@@ -268,7 +333,7 @@ class StlViewerPanel(QWidget):
                 self._actors[fname] = actor
             except Exception as e:
                 print(f"[VIEWER] erreur {fname} : {e}")
-                
+
         for path in sorted(glob.glob(os.path.join(folder, "terrain_gpx_*.stl"))):
             fname = os.path.basename(path)
             try:
@@ -293,21 +358,82 @@ class StlViewerPanel(QWidget):
             except Exception as e:
                 print(f"[VIEWER] erreur {fname} : {e}")
 
+    def _load_puzzle(self, folder, puzzle_files):
+        self._layer_groups = {}
+        self._puzzle_base = {}
+        pieces = {}
+        for path in puzzle_files:
+            fname = os.path.basename(path)
+            match = re.match(r"puzzle_piece(\d+)_(.+)\.stl", fname)
+            if not match:
+                continue
+            piece_idx = int(match.group(1))
+            layer_name = match.group(2)
+            try:
+                loaded = trimesh.load(path)
+                if isinstance(loaded, trimesh.Scene):
+                    mesh = trimesh.util.concatenate(list(loaded.geometry.values()))
+                else:
+                    mesh = loaded
+                if len(mesh.faces) == 0:
+                    continue
+            except Exception as e:
+                print(f"[VIEWER] erreur {fname} : {e}")
+                continue
+            pieces.setdefault(piece_idx, []).append((layer_name, mesh, fname))
+            self._layer_groups.setdefault(layer_name, []).append(fname)
+
+        if not pieces:
+            self._explode_widget.setVisible(False)
+            return
+
+        piece_centers = {}
+        for piece_idx, layers in pieces.items():
+            all_verts = np.vstack([mesh.vertices for _, mesh, _ in layers])
+            piece_centers[piece_idx] = all_verts[:, :2].mean(axis=0)
+
+        global_center = np.mean(list(piece_centers.values()), axis=0)
+
+        for piece_idx, layers in pieces.items():
+            offset_xy = piece_centers[piece_idx] - global_center
+            for layer_name, mesh, fname in layers:
+                self._puzzle_base[fname] = (mesh, offset_xy, layer_name)
+
+        self._explode_widget.setVisible(True)
+        self._apply_explode_factor(self._explode_slider.value() * 0.05)
+
+    def _apply_explode_factor(self, factor):
+        if not getattr(self, "_puzzle_base", None):
+            return
+        self._actors.clear()
+        self._meshes.clear()
+        self._vtk_widget.remove_all_actors()
+        for fname, (mesh, offset_xy, layer_name) in self._puzzle_base.items():
+            exploded = mesh.copy()
+            exploded.apply_translation([offset_xy[0] * factor, offset_xy[1] * factor, 0])
+            color_hex = PUZZLE_LAYER_COLORS.get(layer_name, "#FF0000" if layer_name.startswith("gpx_") else "#888888")
+            actor = trimesh_to_vtk_actor(exploded, color_hex)
+            cb = self._checkboxes.get(layer_name)
+            if cb is not None and not cb.isChecked():
+                actor.SetVisibility(0)
+            self._vtk_widget.add_actor(actor)
+            self._actors[fname] = actor
+            self._meshes[fname] = exploded
         self._vtk_widget.reset_camera()
         self._vtk_widget.render_to_label()
-        self._rebuild_checkboxes()
-        
-        project_name = "topopixel"
-        win = self.window()
-        if hasattr(win, '_project_name'):
-            project_name = win._project_name
-        mf = os.path.join(folder, f"{project_name}.3mf")
-        if os.path.exists(mf):
-            t = datetime.fromtimestamp(os.path.getmtime(mf))
-            self._lbl_3mf_date.setText(f"3MF généré le {t.strftime('%d/%m/%Y %H:%M')}")
-        else:
-            self._lbl_3mf_date.setText("")
 
+    def _on_explode_changed(self, value):
+        factor = value * 0.05
+        self._explode_value_lbl.setText(f"{factor:.2f}")
+        self._apply_explode_factor(factor)
+    
+    def _on_toggle_group(self, fnames, state):
+        visible = state == Qt.CheckState.Checked.value
+        for fname in fnames:
+            if fname in self._actors:
+                self._actors[fname].SetVisibility(1 if visible else 0)
+        self._vtk_widget.render_to_label()
+    
     def _rebuild_checkboxes(self):
         while self._checks_layout.count():
             item = self._checks_layout.takeAt(0)
@@ -315,6 +441,64 @@ class StlViewerPanel(QWidget):
             if w and w not in (self._btn_export_3mf,):
                 w.deleteLater()
         self._checkboxes.clear()
+
+        if getattr(self, "_layer_groups", None):
+            for layer_name, fnames in self._layer_groups.items():
+                if layer_name.startswith("gpx_"):
+                    continue
+                color_hex = PUZZLE_LAYER_COLORS.get(layer_name, "#888888")
+                label = PUZZLE_LAYER_LABELS.get(layer_name, layer_name)
+                r, g, b = hex_to_rgb(color_hex)
+                cb = QCheckBox(label)
+                cb.setChecked(True)
+                cb.setStyleSheet(f"""
+                    QCheckBox {{ color: rgb({r},{g},{b}); font-weight: bold; background: #3C3C3C; padding: 2px 6px; border-radius: 3px; }}
+                    QCheckBox::indicator:checked {{ background: rgb({r},{g},{b}); border: 1px solid rgb({r},{g},{b}); }}
+                    QCheckBox::indicator:unchecked {{ background: #3C3C3C; border: 1px solid rgb({r},{g},{b}); }}
+                """)
+                cb.stateChanged.connect(lambda state, names=fnames: self._on_toggle_group(names, state))
+                self._checks_layout.addWidget(cb)
+                self._checkboxes[layer_name] = cb
+
+            gpx_names = sorted(name for name in self._layer_groups if name.startswith("gpx_"))
+            if gpx_names:
+                gpx_button = QToolButton()
+                gpx_button.setText("GPX")
+                gpx_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+                gpx_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+                gpx_button.setStyleSheet("""
+                    QToolButton {
+                        background: #3C3C3C;
+                        border: 1px solid #555555;
+                        border-radius: 4px;
+                        padding: 2px 22px 2px 8px;
+                        font-weight: bold;
+                        color: #DDDDDD;
+                    }
+                    QToolButton:hover { border: 1px solid #888888; }
+                    QToolButton::menu-indicator {
+                        subcontrol-position: right center;
+                        subcontrol-origin: padding;
+                        right: 6px;
+                    }
+                """)
+                gpx_menu = QMenu(gpx_button)
+                for name in gpx_names:
+                    fnames = self._layer_groups[name]
+                    cb = QCheckBox(name.upper())
+                    cb.setChecked(True)
+                    cb.setStyleSheet("QCheckBox { color: #FF0000; font-weight: bold; padding: 4px 8px; }")
+                    cb.stateChanged.connect(lambda state, names=fnames: self._on_toggle_group(names, state))
+                    action = QWidgetAction(gpx_menu)
+                    action.setDefaultWidget(cb)
+                    gpx_menu.addAction(action)
+                gpx_button.setMenu(gpx_menu)
+                self._checks_layout.addWidget(gpx_button)
+
+            self._checks_layout.addStretch()
+            self._checks_layout.addWidget(self._btn_export_3mf)
+            return
+
         for fname, (color_hex, label) in LAYER_COLORS.items():
             if fname not in self._actors:
                 continue
@@ -386,7 +570,7 @@ class StlViewerPanel(QWidget):
 
         self._checks_layout.addStretch()
         self._checks_layout.addWidget(self._btn_export_3mf)
-
+    
     def _on_toggle(self, fname, state):
         if fname not in self._actors:
             return

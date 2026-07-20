@@ -2,6 +2,8 @@ from logger import log
 from PyQt6.QtCore import QThread, pyqtSignal
 import topopixel as tp
 import pandas as pd
+import rasterio
+import math
 
 class PreviewWorkerAll(QThread):
     ready = pyqtSignal(str, object)
@@ -25,12 +27,24 @@ class PreviewWorker(QThread):
     ready = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)
 
-    def __init__(self, layer, bbox, cache_dir=None, include_railways=False, parent=None):
+    PREVIEW_RESOLUTION_M = 10
+
+    def __init__(self, layer, bbox, cache_dir=None, include_railways=False,
+                 cdse_access_key="", cdse_secret_key="", satellite_calibration=None, parent=None):
         super().__init__(parent)
         self.layer = layer
         self.bbox = bbox
         self.cache_dir = cache_dir or tp.CACHE_DIR
         self.include_railways = include_railways
+        self.cdse_access_key = cdse_access_key
+        self.cdse_secret_key = cdse_secret_key
+        self.satellite_calibration = satellite_calibration or tp.DEFAULT_SATELLITE_CALIBRATION
+
+    def _preview_grid(self):
+        cols = max(1, round((self.bbox["east"] - self.bbox["west"]) * 111320 * math.cos(math.radians((self.bbox["north"] + self.bbox["south"]) / 2)) / self.PREVIEW_RESOLUTION_M))
+        rows = max(1, round((self.bbox["north"] - self.bbox["south"]) * 111320 / self.PREVIEW_RESOLUTION_M))
+        transform = rasterio.transform.from_bounds(self.bbox["west"], self.bbox["south"], self.bbox["east"], self.bbox["north"], cols, rows)
+        return (rows, cols), transform
 
     def run(self):
         try:
@@ -66,6 +80,42 @@ class PreviewWorker(QThread):
             elif self.layer == "buildings":
                 buildings = tp.download_buildings(self.bbox, cache_dir=self.cache_dir)
                 self.ready.emit("buildings", {"buildings": buildings})
+
+            elif self.layer == "landcover":
+                tile_paths = tp.download_lcfm_tiles(self.bbox, self.cdse_access_key, self.cdse_secret_key, self.cache_dir)
+                if not tile_paths:
+                    self.ready.emit("landcover", {"features": []})
+                    return
+                shape, transform = self._preview_grid()
+                grid = tp.reproject_landcover_to_grid(tile_paths, transform, "EPSG:4326", shape, self.PREVIEW_RESOLUTION_M)
+                if grid is None:
+                    self.ready.emit("landcover", {"features": []})
+                    return
+                layer_masks, tree_mask = tp.build_landcover_layer_masks(grid)
+                features = []
+                for target_layer, mask in layer_masks.items():
+                    polys = tp._mask_to_polygon(mask)
+                    features.extend(tp.polygons_to_geo_features(polys, self.bbox, shape, target_layer, "landcover"))
+                tree_polys = tp._mask_to_polygon(tree_mask)
+                features.extend(tp.polygons_to_geo_features(tree_polys, self.bbox, shape, "trees", "landcover"))
+                self.ready.emit("landcover", {"features": features})
+
+            elif self.layer == "satellite":
+                tile_paths = tp.download_worldcover_s2_tiles(self.bbox, self.cache_dir)
+                if not tile_paths:
+                    self.ready.emit("satellite", {"features": []})
+                    return
+                shape, transform = self._preview_grid()
+                rgb_grid = tp.reproject_satellite_to_grid(tile_paths, transform, "EPSG:4326", shape)
+                if rgb_grid is None:
+                    self.ready.emit("satellite", {"features": []})
+                    return
+                layer_masks = tp.classify_satellite_pixels(rgb_grid, self.satellite_calibration)
+                features = []
+                for target_layer, mask in layer_masks.items():
+                    polys = tp._mask_to_polygon(mask)
+                    features.extend(tp.polygons_to_geo_features(polys, self.bbox, shape, target_layer, "satellite"))
+                self.ready.emit("satellite", {"features": features})
 
         except Exception as e:
             self.failed.emit(self.layer, str(e))

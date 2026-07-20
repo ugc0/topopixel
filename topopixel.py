@@ -31,13 +31,22 @@ from pyproj import Transformer
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, uniform_filter
+from scipy.cluster.vq import kmeans2
 import io
+import json
+import boto3
+import csv
 
 OVERPASS_ENDPOINTS = {
     "private.coffee": "https://overpass.private.coffee/api",
     "gall": "https://gall.openstreetmap.de/api",
     "lambert": "https://lambert.openstreetmap.de/api"
+}
+
+_OSM_CACHE_SUBLABELS = {
+    "water": ["water_areas", "waterways", "coastlines"],
+    "vegetation": ["forest", "other_veg"],
 }
 
 def check_overpass_endpoints():
@@ -78,7 +87,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="trimesh")
 os.environ["CPL_LOG"] = "NUL"
 
 RADIUS_M = 3_000
-GPXZ_API_KEY = "ak_0KtNnPbu_v9orPuogXRYmTu0p"
+GPXZ_API_KEY = os.environ.get("GPXZ_API_KEY", "")
 RESOLUTION_M = 5
 CACHE_DIR = "cache"
 
@@ -105,6 +114,8 @@ SIZE_MM = 120.0
 TREE_HEIGHT = 10.0
 TREE_RADIUS = 4.0
 TREE_DENSITY = 5
+TREE_SECTIONS = 7
+MAX_TREES = 6000
 BUILDING_MIN_HEIGHT = 3.0
 BUILDING_MAX_HEIGHT = 20.0
 GPX_WIDTH_PX = 2.0
@@ -114,6 +125,85 @@ WATER_Z_BOT_RATIO_PCT = 33
 VEG_Z_BOT_RATIO_PCT = 90
 BUILDINGS_Z_BOT_RATIO_PCT = 90
 GPX_Z_BOT_RATIO_PCT = 95
+MAX_TERRAIN_GRID_DIM = 800
+
+LCFM_CATALOGUE_URL = "https://s3.waw3-1.cloudferro.com/swift/v1/CatalogueCSV/landcover_landuse/dynamic_land_cover/lcm_global_10m_yearly_v1/lcm_global_10m_yearly_v1_cog.csv"
+LCFM_S3_ENDPOINT = "https://eodata.dataspace.copernicus.eu/"
+
+WORLDCOVER_S2_GRID_URL = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/esa_worldcover_grid_composites.fgb"
+
+LCFM_CLASS_TO_LAYER = {
+    10: "vegetation",
+    20: "vegetation",
+    30: "vegetation",
+    40: "vegetation",
+    50: "vegetation",
+    60: "vegetation",
+    70: "vegetation",
+    80: "terrain",
+    90: "buildings",
+    100: "water",
+    110: "terrain",
+}
+
+LCFM_TREE_CLASSES = {10}
+
+DEFAULT_SATELLITE_CALIBRATION = {
+    "water": [
+        {"color": [85, 86, 61], "nir": 17, "threshold": 40},
+        {"color": [25, 61, 56], "nir": 12, "threshold": 35},
+    ],
+    "vegetation": [
+        {"color": [73, 107, 68], "nir": 188, "threshold": 80},
+        {"color": [173, 163, 109], "nir": 166, "threshold": 60},
+        {"color": [49, 65, 37], "nir": 195, "threshold": 45},
+    ],
+    "buildings": [
+        {"color": [179, 136, 124], "nir": 77, "threshold": 45},
+        {"color": [147, 139, 98], "nir": 135, "threshold": 40},
+        {"color": [177, 100, 73], "nir": 149, "threshold": 45},
+        {"color": [92, 72, 60], "nir": 66, "threshold": 35},
+    ],
+    "trees": [
+        {"color": [55, 85, 50], "nir": 230, "threshold": 40},
+    ],
+}
+
+def make_latlon_to_pixel(bbox, cols, rows):
+    west, east = bbox["west"], bbox["east"]
+    south, north = bbox["south"], bbox["north"]
+
+    def latlon_to_pixel_xy(lat, lon):
+        x = (lon - west) / (east - west) * (cols - 1)
+        y = (lat - south) / (north - south) * (rows - 1)
+        return x, y
+
+    return latlon_to_pixel_xy
+
+def pixel_bbox_polygon(cols, rows):
+    return ShPoly([(0, 0), (cols - 1, 0), (cols - 1, rows - 1), (0, rows - 1)])
+
+def make_polygon_projector(bbox, cols, rows, clip_to_bbox=True):
+    latlon_to_pixel_xy = make_latlon_to_pixel(bbox, cols, rows)
+    bbox_pixel = pixel_bbox_polygon(cols, rows) if clip_to_bbox else None
+
+    def project_polygon(geom):
+        if geom.geom_type != "Polygon":
+            return None
+        exterior = [latlon_to_pixel_xy(lat, lon) for lon, lat in geom.exterior.coords]
+        interiors = [[latlon_to_pixel_xy(lat, lon) for lon, lat in ring.coords]
+                     for ring in geom.interiors]
+        p = ShPoly(exterior, interiors)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if bbox_pixel is not None:
+            p = p.intersection(bbox_pixel)
+            if not p.is_valid:
+                p = p.buffer(0)
+        return p if not p.is_empty and p.area > 0 else None
+
+    return project_polygon
+
 
 def meters_to_deg(meters, latitude):
     lat_deg = meters / 111_320
@@ -161,6 +251,365 @@ def split_bbox(bbox, max_area_km2=MAX_AREA_KM2):
 
     log(f"Zone {total_km2:.1f}km² découpée en {len(tiles)} tuiles ({n_lat}×{n_lon})")
     return tiles
+
+def _lcfm_catalogue_path(cache_dir=CACHE_DIR):
+    return os.path.join(cache_dir, "landcover", "lcm_global_10m_yearly_v1_cog.csv")
+
+def _fetch_lcfm_catalogue(cache_dir=CACHE_DIR, max_age_days=7):
+    path = _lcfm_catalogue_path(cache_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        age_days = (time.time() - os.path.getmtime(path)) / 86400
+        if age_days < max_age_days:
+            return path
+    try:
+        r = requests.get(LCFM_CATALOGUE_URL, timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+        log("[LANDCOVER] catalogue LCFM téléchargé")
+    except Exception as e:
+        if os.path.exists(path):
+            log(f"[LANDCOVER] catalogue LCFM non rafraîchi ({e}), utilisation du cache existant")
+        else:
+            log(f"[LANDCOVER] catalogue LCFM inaccessible : {e}")
+            return None
+    return path
+
+def _parse_lcfm_bbox(bbox_str):
+    coords_str = bbox_str.strip().removeprefix("POLYGON((").removesuffix("))")
+    pts = [tuple(map(float, p.split())) for p in coords_str.split(",")]
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    return min(lons), min(lats), max(lons), max(lats)
+
+def find_lcfm_tiles(bbox, cache_dir=CACHE_DIR):
+    catalogue_path = _fetch_lcfm_catalogue(cache_dir)
+    if catalogue_path is None:
+        return []
+    best_by_tile = {}
+    with open(catalogue_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            west, south, east, north = _parse_lcfm_bbox(row["bbox"])
+            if east < bbox["west"] or west > bbox["east"] or north < bbox["south"] or south > bbox["north"]:
+                continue
+            tile_key = (west, south)
+            nominal_date = row["nominal_date"]
+            if tile_key not in best_by_tile or nominal_date > best_by_tile[tile_key]["nominal_date"]:
+                best_by_tile[tile_key] = row
+    log(f"[LANDCOVER] {len(best_by_tile)} tuile(s) LCFM trouvée(s) pour la bbox")
+    return list(best_by_tile.values())
+
+def download_lcfm_tiles(bbox, access_key, secret_key, cache_dir=CACHE_DIR):
+    rows = find_lcfm_tiles(bbox, cache_dir)
+    if not rows:
+        return []
+    client = boto3.client(
+        "s3",
+        endpoint_url=LCFM_S3_ENDPOINT,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="default",
+    )
+    landcover_dir = os.path.join(cache_dir, "landcover")
+    os.makedirs(landcover_dir, exist_ok=True)
+    paths = []
+    for row in rows:
+        s3_path = row["s3_path"]
+        prefix = s3_path[len("s3://eodata/"):]
+        tile_id = row["name"].removesuffix("_cog")
+        real_key = f"{prefix}/{tile_id}_MAP.tif"
+        fname = f"{tile_id}_MAP.tif"
+        local_path = os.path.join(landcover_dir, fname)
+        if os.path.exists(local_path):
+            log(f"[LANDCOVER CACHE] hit : {fname}")
+            paths.append(local_path)
+            continue
+        try:
+            client.download_file("eodata", real_key, local_path)
+            log(f"[LANDCOVER] téléchargé : {fname}")
+            paths.append(local_path)
+        except Exception as e:
+            log(f"[LANDCOVER] téléchargement échoué pour '{real_key}' : {e}")
+    return paths
+
+def reproject_landcover_to_grid(tile_paths, dst_transform, dst_crs, dst_shape, resolution_m):
+    if not tile_paths:
+        return None
+
+    from rasterio.warp import reproject, Resampling
+
+    srcs = [rasterio.open(p) for p in tile_paths]
+    try:
+        if len(srcs) > 1:
+            mosaic, mosaic_transform = rasterio_merge(srcs, method="first")
+            mosaic_data = mosaic[0]
+        else:
+            mosaic_data = srcs[0].read(1)
+            mosaic_transform = srcs[0].transform
+        mosaic_crs = srcs[0].crs
+    finally:
+        for s in srcs:
+            s.close()
+
+    target_height, target_width = dst_shape
+    landcover = np.zeros((target_height, target_width), dtype=np.uint8)
+
+    resampling_method = Resampling.nearest if resolution_m <= 10 else Resampling.mode
+
+    reproject(
+        source=mosaic_data,
+        destination=landcover,
+        src_transform=mosaic_transform,
+        src_crs=mosaic_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=resampling_method,
+        src_nodata=255,
+        dst_nodata=255,
+    )
+
+    log(f"[LANDCOVER] recalé sur la grille DEM : shape={landcover.shape} resampling={resampling_method.name}")
+    return landcover
+
+def build_landcover_layer_masks(landcover_grid):
+    layer_masks = {}
+    for code, layer in LCFM_CLASS_TO_LAYER.items():
+        if layer == "terrain":
+            continue
+        mask = landcover_grid == code
+        if not mask.any():
+            continue
+        layer_masks.setdefault(layer, np.zeros_like(mask))
+        layer_masks[layer] |= mask
+
+    tree_mask = np.zeros_like(landcover_grid, dtype=bool)
+    for code in LCFM_TREE_CLASSES:
+        tree_mask |= landcover_grid == code
+
+    log(f"[LANDCOVER] masques par couche : {[(k, int(v.sum())) for k, v in layer_masks.items()]}")
+    return layer_masks, tree_mask
+
+def _majority_filter(mask, size=3):
+    smoothed = uniform_filter(mask.astype(np.float32), size=size, mode="nearest")
+    return smoothed > 0.5
+
+def _mask_to_polygon(mask, min_area_px=2.0):
+    mask = np.flipud(mask)
+    mask = _majority_filter(mask)
+    if not mask.any():
+        return None
+    identity = rasterio.transform.Affine.identity()
+    shapes_gen = rasterio.features.shapes(mask.astype(np.uint8), mask=mask, transform=identity)
+    polys = [shape(geom) for geom, value in shapes_gen]
+    if not polys:
+        return None
+    merged = unary_union(polys).buffer(0.5, join_style=1).buffer(-0.3, join_style=1)
+    if merged.is_empty:
+        return None
+    geoms = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+    geoms = [g for g in geoms if g.is_valid and g.area >= min_area_px]
+    return geoms
+
+def polygons_to_geo_features(polys, bbox, shape, layer, source):
+    rows, cols = shape
+
+    def pixel_to_lonlat(x, y):
+        lon = bbox["west"] + x / (cols - 1) * (bbox["east"] - bbox["west"])
+        lat = bbox["south"] + y / (rows - 1) * (bbox["north"] - bbox["south"])
+        return lon, lat
+
+    features = []
+    for poly in polys:
+        synthetic_id = _pixel_poly_to_synthetic_id(poly, bbox, shape, layer, source)
+        exterior = [pixel_to_lonlat(x, y) for x, y in poly.exterior.coords]
+        interiors = [[pixel_to_lonlat(x, y) for x, y in ring.coords] for ring in poly.interiors]
+        geo_poly = ShPoly(exterior, interiors)
+        if not geo_poly.is_valid:
+            geo_poly = geo_poly.buffer(0)
+        if geo_poly.is_empty:
+            continue
+        features.append({"id": synthetic_id, "type": layer, "source": source, "geometry": geo_poly})
+    return features
+
+def _pixel_poly_to_synthetic_id(poly, bbox, shape, layer, source):
+    rows, cols = shape
+    rep = poly.convex_hull.centroid
+    lon = bbox["west"] + rep.x / (cols - 1) * (bbox["east"] - bbox["west"])
+    lat = bbox["south"] + rep.y / (rows - 1) * (bbox["north"] - bbox["south"])
+    width_m = (bbox["east"] - bbox["west"]) * 111320 * math.cos(math.radians((bbox["north"] + bbox["south"]) / 2))
+    height_m = (bbox["north"] - bbox["south"]) * 111320
+    pixel_area_m2 = (width_m / cols) * (height_m / rows)
+    area_m2 = poly.area * pixel_area_m2
+    area_bucket = 0
+    area = area_m2
+    while area > 25:
+        area /= 2
+        area_bucket += 1
+    return f"{layer}_{source}_{lat:.4f}_{lon:.4f}_{area_bucket}"
+    
+def is_fill_polygon_excluded(poly, bbox, shape, layer, source, excluded_fill_features, resolution_m):
+    if not excluded_fill_features:
+        return False
+    rows, cols = shape
+    rep = poly.convex_hull.centroid
+    lon = bbox["west"] + rep.x / (cols - 1) * (bbox["east"] - bbox["west"])
+    lat = bbox["south"] + rep.y / (rows - 1) * (bbox["north"] - bbox["south"])
+
+    threshold_m = resolution_m * 4
+    lat_rad = math.radians((bbox["north"] + bbox["south"]) / 2)
+
+    for excl in excluded_fill_features:
+        if excl["type"] != layer or excl["source"] != source:
+            continue
+        dx_m = (lon - excl["lon"]) * 111320 * math.cos(lat_rad)
+        dy_m = (lat - excl["lat"]) * 111320
+        dist_m = math.hypot(dx_m, dy_m)
+        if dist_m <= threshold_m:
+            return True
+    return False
+
+def landcover_masks_to_polygons(layer_masks, tree_mask, bbox=None, shape=None, excluded_fill_features=None, resolution_m=5):
+    excluded_fill_features = excluded_fill_features or []
+    layer_polygons = {}
+    for layer, mask in layer_masks.items():
+        polys = _mask_to_polygon(mask)
+        if bbox is not None and shape is not None and polys:
+            polys = [
+                p for p in polys
+                if not is_fill_polygon_excluded(p, bbox, shape, layer, "landcover", excluded_fill_features, resolution_m)
+            ]
+        poly = unary_union(polys) if polys else None
+        if poly is not None:
+            layer_polygons[layer] = poly
+            log(f"[LANDCOVER] polygone '{layer}' : aire={poly.area:.1f}px²")
+        else:
+            log(f"[LANDCOVER] polygone '{layer}' : vide après filtrage/lissage")
+
+    tree_polys = _mask_to_polygon(tree_mask)
+    if bbox is not None and shape is not None and tree_polys:
+        tree_polys = [
+            p for p in tree_polys
+            if not is_fill_polygon_excluded(p, bbox, shape, "trees", "landcover", excluded_fill_features, resolution_m)
+        ]
+    tree_polygon = unary_union(tree_polys) if tree_polys else None
+    if tree_polygon is not None:
+        log(f"[LANDCOVER] polygone 'trees' : aire={tree_polygon.area:.1f}px²")
+
+    return layer_polygons, tree_polygon
+
+def _worldcover_s2_grid_path(cache_dir=CACHE_DIR):
+    return os.path.join(cache_dir, "satellite", "esa_worldcover_grid_composites.fgb")
+
+def _fetch_worldcover_s2_grid(cache_dir=CACHE_DIR, max_age_days=30):
+    path = _worldcover_s2_grid_path(cache_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        age_days = (time.time() - os.path.getmtime(path)) / 86400
+        if age_days < max_age_days:
+            return path
+    try:
+        r = requests.get(WORLDCOVER_S2_GRID_URL, timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+        log("[SATELLITE] grille des tuiles S2 téléchargée")
+    except Exception as e:
+        if os.path.exists(path):
+            log(f"[SATELLITE] grille non rafraîchie ({e}), utilisation du cache existant")
+        else:
+            log(f"[SATELLITE] grille inaccessible : {e}")
+            return None
+    return path
+
+def find_worldcover_s2_tiles(bbox, cache_dir=CACHE_DIR):
+    grid_path = _fetch_worldcover_s2_grid(cache_dir)
+    if grid_path is None:
+        return []
+    grid = gpd.read_file(grid_path)
+    query_box = box(bbox["west"], bbox["south"], bbox["east"], bbox["north"])
+    matches = grid[grid.geometry.intersects(query_box)]
+    log(f"[SATELLITE] {len(matches)} tuile(s) S2 trouvée(s) pour la bbox")
+    return matches
+
+def download_worldcover_s2_tiles(bbox, cache_dir=CACHE_DIR):
+    matches = find_worldcover_s2_tiles(bbox, cache_dir)
+    if len(matches) == 0:
+        return []
+    satellite_dir = os.path.join(cache_dir, "satellite")
+    os.makedirs(satellite_dir, exist_ok=True)
+    paths = []
+    for _, row in matches.iterrows():
+        s3_uri = row.get("s2_rgbnir_2021") or row.get("s2_rgbnir_2020")
+        if not s3_uri:
+            log(f"[SATELLITE] ligne de grille sans URL rgbnir exploitable, tuile={row.get('tile')}")
+            continue
+        key = s3_uri[len("s3://esa-worldcover-s2/"):]
+        url = f"https://esa-worldcover-s2.s3.eu-central-1.amazonaws.com/{key}"
+        tile_id = os.path.splitext(os.path.basename(key))[0]
+        crop_fname = f"{tile_id}_crop_{bbox['west']:.4f}_{bbox['south']:.4f}_{bbox['east']:.4f}_{bbox['north']:.4f}.tif"
+        local_path = os.path.join(satellite_dir, crop_fname)
+        if os.path.exists(local_path):
+            log(f"[SATELLITE CACHE] hit : {crop_fname}")
+            paths.append(local_path)
+            continue
+        try:
+            with rasterio.open(f"/vsicurl/{url}") as src:
+                window = rasterio.windows.from_bounds(
+                    bbox["west"], bbox["south"], bbox["east"], bbox["north"],
+                    transform=src.transform
+                )
+                window = window.round_lengths().round_offsets()
+                data = src.read(window=window, boundless=True, fill_value=0)
+                window_transform = src.window_transform(window)
+                profile = src.profile.copy()
+                profile.update({"height": data.shape[1], "width": data.shape[2], "transform": window_transform})
+            with rasterio.open(local_path, "w", **profile) as dst:
+                dst.write(data)
+            log(f"[SATELLITE] fenêtre téléchargée ({data.shape[2]}x{data.shape[1]}px) : {crop_fname}")
+            paths.append(local_path)
+        except Exception as e:
+            log(f"[SATELLITE] téléchargement échoué pour {url} : {e}")
+    return paths
+
+def reproject_satellite_to_grid(tile_paths, dst_transform, dst_crs, dst_shape):
+    if not tile_paths:
+        return None
+
+    from rasterio.warp import reproject, Resampling
+
+    srcs = [rasterio.open(p) for p in tile_paths]
+    try:
+        if len(srcs) > 1:
+            mosaic, mosaic_transform = rasterio_merge(srcs, method="first")
+        else:
+            mosaic = srcs[0].read()
+            mosaic_transform = srcs[0].transform
+        mosaic_crs = srcs[0].crs
+        band_count = mosaic.shape[0]
+    finally:
+        for s in srcs:
+            s.close()
+
+    target_height, target_width = dst_shape
+    rgb = np.zeros((band_count, target_height, target_width), dtype=np.float32)
+
+    for band_idx in range(band_count):
+        reproject(
+            source=mosaic[band_idx],
+            destination=rgb[band_idx],
+            src_transform=mosaic_transform,
+            src_crs=mosaic_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+            src_nodata=0,
+            dst_nodata=0,
+        )
+
+    log(f"[SATELLITE] recalé sur la grille DEM : shape={rgb.shape}")
+    return rgb
 
 def download_dem_gpxz_tiled(bbox, api_key, resolution_m=RESOLUTION_M, cache_dir=CACHE_DIR):
     tiles = split_bbox(bbox)
@@ -338,7 +787,161 @@ def _extract_bbox_from_cache(source_path, bbox, output_path):
 
     log(f"[CACHE] sous-région extraite → {output_path} ({rows}×{cols} px)")
     return output_path
-    
+
+def classify_satellite_pixels(rgb, calibration):
+    red, green, blue, nir = rgb[0], rgb[1], rgb[2], rgb[3]
+    valid_mask = (red > 0) | (green > 0) | (blue > 0)
+
+    pixels_rgb_valid = np.stack([red[valid_mask], green[valid_mask], blue[valid_mask]], axis=1).astype(np.float64)
+    pixels_nir_valid = nir[valid_mask].astype(np.float64)
+
+    if len(pixels_rgb_valid) == 0:
+        return {}
+
+    scale_rgb = np.percentile(pixels_rgb_valid, 99)
+    if scale_rgb <= 0:
+        scale_rgb = 1.0
+    scale_nir = np.percentile(pixels_nir_valid, 99)
+    if scale_nir <= 0:
+        scale_nir = 1.0
+
+    r255 = np.clip(red.astype(np.float64) / scale_rgb, 0, 1) * 255
+    g255 = np.clip(green.astype(np.float64) / scale_rgb, 0, 1) * 255
+    b255 = np.clip(blue.astype(np.float64) / scale_rgb, 0, 1) * 255
+    nir255 = np.clip(nir.astype(np.float64) / scale_nir, 0, 1) * 255
+
+    pixels_scaled = np.stack([r255, g255, b255, nir255], axis=-1)
+
+    layer_names = list(calibration.keys())
+    best_layer_idx = np.full(red.shape, -1, dtype=np.int32)
+    best_distance = np.full(red.shape, np.inf, dtype=np.float64)
+
+    for layer_idx, layer in enumerate(layer_names):
+        for ref in calibration[layer]:
+            ref_vec = np.array(list(ref["color"]) + [ref.get("nir", 128)], dtype=np.float64)
+            distance = np.linalg.norm(pixels_scaled - ref_vec, axis=-1)
+            within_threshold = distance <= ref["threshold"]
+            better = within_threshold & (distance < best_distance)
+            best_distance = np.where(better, distance, best_distance)
+            best_layer_idx = np.where(better, layer_idx, best_layer_idx)
+
+    best_layer_idx = np.where(valid_mask, best_layer_idx, -1)
+
+    layer_masks = {}
+    for idx, layer in enumerate(layer_names):
+        mask = best_layer_idx == idx
+        if mask.any():
+            layer_masks[layer] = mask
+
+    counts = {k: int(v.sum()) for k, v in layer_masks.items()}
+    log(f"[SATELLITE] classification directe par pixel : {counts}")
+    return layer_masks
+
+def satellite_masks_to_polygons(layer_masks, bbox=None, shape=None, excluded_fill_features=None, resolution_m=5):
+    excluded_fill_features = excluded_fill_features or []
+    layer_polygons = {}
+    for layer, mask in layer_masks.items():
+        polys = _mask_to_polygon(mask)
+        if bbox is not None and shape is not None and polys:
+            polys = [
+                p for p in polys
+                if not is_fill_polygon_excluded(p, bbox, shape, layer, "satellite", excluded_fill_features, resolution_m)
+            ]
+        poly = unary_union(polys) if polys else None
+        if poly is not None:
+            layer_polygons[layer] = poly
+            log(f"[SATELLITE] polygone '{layer}' : aire={poly.area:.1f}px²")
+    return layer_polygons
+
+def compute_osm_coverage(*polygons):
+    valid = [p for p in polygons if p is not None and not p.is_empty]
+    if not valid:
+        return None
+    coverage = unary_union(valid)
+    log(f"[PRIORITE] zone OSM couverte : aire={coverage.area:.1f}px²")
+    return coverage
+
+def _boolean_op(op, meshes, label):
+    t0 = time.time()
+    log(f"[{label}] boolean {op.__name__} : début")
+    result = op(meshes, engine='manifold')
+    log(f"[{label}] boolean {op.__name__} : terminé en {time.time() - t0:.1f}s")
+    return result
+
+def _extrude_watertight(poly, height, z_translate, label):
+    try:
+        m = trimesh.creation.extrude_polygon(poly, height=height)
+        m.apply_translation([0, 0, z_translate])
+    except Exception as e:
+        log(f"[{label}] extrusion d'une pièce échouée : {e}")
+        return None
+
+    if not m.is_watertight:
+        m.merge_vertices()
+        trimesh.repair.fix_normals(m)
+        trimesh.repair.fill_holes(m)
+
+    if not m.is_watertight:
+        return None
+
+    return m
+
+def _extrude_polygons_watertight(polygons, height, z_translate, label, min_area=0.5):
+    meshes = []
+    skipped = 0
+    for poly in polygons:
+        if poly is None or not poly.is_valid or poly.area < min_area:
+            skipped += 1
+            continue
+        m = _extrude_watertight(poly, height, z_translate, label)
+        if m is None:
+            skipped += 1
+            continue
+        meshes.append(m)
+
+    if skipped:
+        log(f"[{label}] {skipped} pièce(s) écartée(s) sur {len(polygons)} (géométrie irréparable)")
+
+    return meshes
+
+def _concatenate_watertight(meshes, label):
+    if not meshes:
+        return None
+
+    masque = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    trimesh.repair.fix_normals(masque)
+
+    if not masque.is_watertight:
+        masque.merge_vertices()
+        trimesh.repair.fix_normals(masque)
+        trimesh.repair.fill_holes(masque)
+
+    log(f"[{label}] masque final : faces={len(masque.faces)} pièces={len(meshes)} watertight={masque.is_watertight}")
+    return masque
+
+def build_fill_mask(polygon, z_bot_ratio_pct, mesh_terrain):
+    if polygon is None or polygon.is_empty:
+        return None
+    z_bot = -BASE_THICKNESS + BASE_THICKNESS * (z_bot_ratio_pct / 100)
+    z_top = mesh_terrain.bounds[1][2] + 1.0
+    geoms = list(polygon.geoms) if polygon.geom_type == "MultiPolygon" else [polygon]
+    masque_meshes = []
+    for part in geoms:
+        if part.is_empty or part.area < 0.5:
+            continue
+        try:
+            m = trimesh.creation.extrude_polygon(part, height=z_top - z_bot)
+            m.apply_translation([0, 0, z_bot])
+            masque_meshes.append(m)
+        except Exception as e:
+            log(f"[FILL] extrusion échouée : {e}")
+            continue
+    if not masque_meshes:
+        return None
+    masque = trimesh.util.concatenate(masque_meshes) if len(masque_meshes) > 1 else masque_meshes[0]
+    trimesh.repair.fix_normals(masque)
+    return masque
+
 def download_dem_gpxz(bbox, api_key, resolution_m=RESOLUTION_M, cache_dir=CACHE_DIR, max_retries=5):
     output_path = get_cache_path(bbox, resolution_m, cache_dir)
 
@@ -402,28 +1005,42 @@ def load_dem(dem_path):
 
 def build_terrain_mesh(elevation, z_min):
     rows, cols = elevation.shape
-    z_surface = (elevation - z_min) / RESOLUTION_M * Z_SCALE
+    stride = max(1, math.ceil(max(rows, cols) / MAX_TERRAIN_GRID_DIM))
 
-    r_idx, c_idx = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+    if stride > 1:
+        elevation_smooth = uniform_filter(elevation, size=stride, mode='nearest')
+    else:
+        elevation_smooth = elevation
+
+    row_idx = np.arange(0, rows, stride)
+    col_idx = np.arange(0, cols, stride)
+    elevation_ds = elevation_smooth[np.ix_(row_idx, col_idx)]
+    rows_ds, cols_ds = elevation_ds.shape
+
+    log(f"[TERRAIN] grille {rows}x{cols} → {rows_ds}x{cols_ds} (stride={stride})")
+
+    z_surface = (elevation_ds - z_min) / RESOLUTION_M * Z_SCALE
+
+    r_idx, c_idx = np.meshgrid(np.arange(rows_ds), np.arange(cols_ds), indexing='ij')
 
     verts_top = np.stack([
-        c_idx.ravel().astype(np.float64),
-        (rows - 1 - r_idx.ravel()).astype(np.float64),
+        col_idx[c_idx.ravel()].astype(np.float64),
+        (rows - 1 - row_idx[r_idx.ravel()]).astype(np.float64),
         z_surface.ravel().astype(np.float64)
     ], axis=1)
 
     verts_bot = np.stack([
-        c_idx.ravel().astype(np.float64),
-        (rows - 1 - r_idx.ravel()).astype(np.float64),
-        np.full(rows * cols, -BASE_THICKNESS, dtype=np.float64)
+        col_idx[c_idx.ravel()].astype(np.float64),
+        (rows - 1 - row_idx[r_idx.ravel()]).astype(np.float64),
+        np.full(rows_ds * cols_ds, -BASE_THICKNESS, dtype=np.float64)
     ], axis=1)
 
     def vidx(r, c):
-        return r * cols + c
+        return r * cols_ds + c
 
     faces_top, faces_bot = [], []
-    for r in range(rows - 1):
-        for c in range(cols - 1):
+    for r in range(rows_ds - 1):
+        for c in range(cols_ds - 1):
             i00, i10 = vidx(r, c),   vidx(r+1, c)
             i01, i11 = vidx(r, c+1), vidx(r+1, c+1)
             faces_top.append([i00, i01, i10])
@@ -431,25 +1048,25 @@ def build_terrain_mesh(elevation, z_min):
             faces_bot.append([i00, i10, i01])
             faces_bot.append([i01, i10, i11])
 
-    n = rows * cols
+    n = rows_ds * cols_ds
     faces_bot_off = [[f[0]+n, f[1]+n, f[2]+n] for f in faces_bot]
 
     faces_sides = []
-    for c in range(cols - 1):
+    for c in range(cols_ds - 1):
         t0, t1 = vidx(0, c), vidx(0, c+1)
         b0, b1 = t0+n, t1+n
         faces_sides.append([t0, b0, t1])
         faces_sides.append([t1, b0, b1])
-        t0, t1 = vidx(rows-1, c), vidx(rows-1, c+1)
+        t0, t1 = vidx(rows_ds-1, c), vidx(rows_ds-1, c+1)
         b0, b1 = t0+n, t1+n
         faces_sides.append([t0, t1, b0])
         faces_sides.append([t1, b1, b0])
-    for r in range(rows - 1):
+    for r in range(rows_ds - 1):
         t0, t1 = vidx(r, 0), vidx(r+1, 0)
         b0, b1 = t0+n, t1+n
         faces_sides.append([t0, t1, b0])
         faces_sides.append([t1, b1, b0])
-        t0, t1 = vidx(r, cols-1), vidx(r+1, cols-1)
+        t0, t1 = vidx(r, cols_ds-1), vidx(r+1, cols_ds-1)
         b0, b1 = t0+n, t1+n
         faces_sides.append([t0, b0, t1])
         faces_sides.append([t1, b0, b1])
@@ -477,14 +1094,10 @@ def build_roads_mask(road_edges, bbox, shape, mesh_terrain):
 
     if road_edges is None:
         log("[ROADS] aucune edge OSM, mesh vide")
-        return None
+        return None, None
 
-    def latlon_to_pixel_xy(lat, lon):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
-
-    bbox_pixel = ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)])
+    latlon_to_pixel_xy = make_latlon_to_pixel(bbox, cols, rows)
+    bbox_pixel = pixel_bbox_polygon(cols, rows)
     pixel_lines = []
     for geom in road_edges.geometry:
         coords = list(geom.coords)
@@ -500,7 +1113,7 @@ def build_roads_mask(road_edges, bbox, shape, mesh_terrain):
 
     if not buffered:
         log("[ROADS] aucun polygone valide")
-        return None
+        return None, None
 
     merged = unary_union(buffered).buffer(0.3, join_style=1).buffer(-0.2, join_style=1)
     log(f"[ROADS] après union+lissage : type={merged.geom_type}")
@@ -517,47 +1130,25 @@ def build_roads_mask(road_edges, bbox, shape, mesh_terrain):
 
     if not geom_list:
         log("[ROADS] aucun polygone valide après simplification")
-        return None
+        return None, None
 
-    masque_meshes = []
-    failed_count = 0
-    for poly in geom_list:
-        try:
-            m = trimesh.creation.extrude_polygon(poly, height=z_top - z_bot)
-            m.apply_translation([0, 0, z_bot])
-            if not m.is_watertight:
-                m.merge_vertices()
-                trimesh.repair.fix_normals(m)
-                trimesh.repair.fill_holes(m)
-            masque_meshes.append(m)
-        except Exception as e:
-            failed_count += 1
-            continue
-
-    if failed_count > 0:
-        log(f"[ROADS] {failed_count} polygones ignorés sur {len(geom_list)}")
+    masque_meshes = _extrude_polygons_watertight(geom_list, z_top - z_bot, z_bot, "ROADS")
 
     if not masque_meshes:
         log("[ROADS] aucun masque généré")
-        return None
+        return None, None
 
-    masque = trimesh.util.concatenate(masque_meshes)
-    trimesh.repair.fix_normals(masque)
-    log(f"[ROADS] masque brut : faces={len(masque.faces)} watertight={masque.is_watertight}")
+    masque = _concatenate_watertight(masque_meshes, "ROADS")
 
-    if not masque.is_watertight:
-        masque.merge_vertices()
-        trimesh.repair.fix_normals(masque)
-        trimesh.repair.fill_holes(masque)
-
-    return masque
+    roads_polygon = unary_union(geom_list)
+    return masque, roads_polygon
 
 def apply_roads_boolean(masque, mesh_terrain, mesh_terrain_pristine):
     if masque is None:
         return trimesh.Trimesh(), mesh_terrain
 
     try:
-        mesh_roads = trimesh.boolean.intersection([mesh_terrain_pristine, masque], engine='manifold')
+        mesh_roads = _boolean_op(trimesh.boolean.intersection, [mesh_terrain_pristine, masque], "ROADS")
     except Exception as e:
         log(f"[ROADS] intersection échouée : {e}")
         return trimesh.Trimesh(), mesh_terrain
@@ -570,39 +1161,22 @@ def apply_roads_boolean(masque, mesh_terrain, mesh_terrain_pristine):
     trimesh.repair.fix_normals(masque_trou)
 
     try:
-        mesh_terrain_new = trimesh.boolean.difference([mesh_terrain, masque_trou], engine='manifold')
+        mesh_terrain_new = _boolean_op(trimesh.boolean.difference, [mesh_terrain, masque_trou], "ROADS")
     except Exception as e:
         log(f"[ROADS] soustraction terrain échouée : {e}")
         return mesh_roads, mesh_terrain
     log(f"[ROADS] terrain après soustraction : faces={len(mesh_terrain_new.faces)} watertight={mesh_terrain_new.is_watertight}")
-    
+
     return mesh_roads, mesh_terrain_new
 
-def build_water_mask(water_areas, waterways, bbox, shape, mesh_terrain, z_min, enable_bathymetry=False, elevation=None):
+def build_water_mask(water_areas, waterways, bbox, shape, mesh_terrain, z_min, enable_bathymetry=False, elevation=None, roads_polygon=None, extra_fill_polygon=None):
     rows, cols = shape
     z_bot = -BASE_THICKNESS + BASE_THICKNESS * (WATER_Z_BOT_RATIO_PCT / 100)
     z_top = mesh_terrain.bounds[1][2] + 1.0
     sea_level_z = -z_min / RESOLUTION_M
-    bbox_pixel = ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)])
-
-    def latlon_to_pixel_xy(lat, lon):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
-
-    def convert_polygon(geom):
-        if geom.geom_type != "Polygon":
-            return None
-        exterior = [latlon_to_pixel_xy(lat, lon) for lon, lat in geom.exterior.coords]
-        interiors = [[latlon_to_pixel_xy(lat, lon) for lon, lat in ring.coords]
-                     for ring in geom.interiors]
-        p = ShPoly(exterior, interiors)
-        if not p.is_valid:
-            p = p.buffer(0)
-        p = p.intersection(bbox_pixel)
-        if not p.is_valid:
-            p = p.buffer(0)
-        return p if not p.is_empty and p.area > 0 else None
+    bbox_pixel = pixel_bbox_polygon(cols, rows)
+    latlon_to_pixel_xy = make_latlon_to_pixel(bbox, cols, rows)
+    convert_polygon = make_polygon_projector(bbox, cols, rows)
 
     pixel_polys = []
     has_ocean_col = water_areas is not None and "is_ocean" in water_areas.columns
@@ -645,9 +1219,11 @@ def build_water_mask(water_areas, waterways, bbox, shape, mesh_terrain, z_min, e
 
     log(f"[WATER] {len(pixel_polys)} polygones convertis")
 
-    if not pixel_polys:
+    has_fill = extra_fill_polygon is not None and not extra_fill_polygon.is_empty
+
+    if not pixel_polys and not has_fill:
         log("[WATER] aucun polygone, mesh vide")
-        return None
+        return None, None, None
 
     exploded_polys = []
     for poly, is_ocean in pixel_polys:
@@ -657,59 +1233,73 @@ def build_water_mask(water_areas, waterways, bbox, shape, mesh_terrain, z_min, e
         else:
             exploded_polys.append((poly, is_ocean))
 
+    non_ocean_polys = [poly for poly, is_ocean in exploded_polys if not is_ocean and poly.is_valid and poly.area >= 0.5]
+    ocean_polys = [poly for poly, is_ocean in exploded_polys if is_ocean and poly.is_valid and poly.area >= 0.5]
+
+    water_footprint_parts = []
+
     masque_meshes = []
+    lacs_polys_to_extrude = []
+    if non_ocean_polys or has_fill:
+        merged = unary_union(non_ocean_polys) if non_ocean_polys else None
+        if roads_polygon is not None and not roads_polygon.is_empty and merged is not None:
+            merged = merged.difference(roads_polygon)
+            if not merged.is_valid:
+                merged = merged.buffer(0)
+        if has_fill:
+            merged = unary_union([merged, extra_fill_polygon]) if merged is not None else extra_fill_polygon
+            merged = merged.buffer(0.5, join_style=1).buffer(-0.5, join_style=1)
+            if not merged.is_valid:
+                merged = merged.buffer(0)
+        merged_parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+        log(f"[WATER] {len(non_ocean_polys)} polygones OSM + remplissage éventuel fusionnés en {len(merged_parts)} forme(s)")
+        for part in merged_parts:
+            if part.is_empty or part.area < 0.5:
+                continue
+            water_footprint_parts.append(part)
+            lacs_polys_to_extrude.append(part)
+        masque_meshes = _extrude_polygons_watertight(lacs_polys_to_extrude, z_top - z_bot, z_bot, "WATER")
+
     ocean_meshes = []
-    for poly, is_ocean in exploded_polys:
-        if not poly.is_valid or poly.area < 0.5:
-            continue
+    ocean_skipped = 0
+    for poly in ocean_polys:
+        if roads_polygon is not None and not roads_polygon.is_empty:
+            poly = poly.difference(roads_polygon)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or poly.area < 0.5:
+                continue
+        water_footprint_parts.append(poly)
         try:
-            if is_ocean:
-                if enable_bathymetry:
-                    m = _build_ocean_bathymetric_mesh(poly, elevation, bbox, shape, z_min, sea_level_z, z_bot, WATER_HEIGHT)
-                    if m is None:
-                        continue
-                else:
-                    m = trimesh.creation.extrude_polygon(poly, height=sea_level_z - z_bot)
-                    m.apply_translation([0, 0, z_bot])
-                ocean_meshes.append(m)
+            if enable_bathymetry:
+                m = _build_ocean_bathymetric_mesh(poly, elevation, bbox, shape, z_min, sea_level_z, z_bot, WATER_HEIGHT)
+                if m is None:
+                    ocean_skipped += 1
+                    continue
             else:
-                m = trimesh.creation.extrude_polygon(poly, height=z_top - z_bot)
+                m = trimesh.creation.extrude_polygon(poly, height=sea_level_z - z_bot)
                 m.apply_translation([0, 0, z_bot])
-                masque_meshes.append(m)
+            if not m.is_watertight:
+                m.merge_vertices()
+                trimesh.repair.fix_normals(m)
+                trimesh.repair.fill_holes(m)
+            if not m.is_watertight:
+                ocean_skipped += 1
+                continue
+            ocean_meshes.append(m)
         except Exception as e:
-            log(f"[WATER] extrusion masque échouée : {e}")
+            log(f"[WATER] extrusion masque océan échouée : {e}")
+            ocean_skipped += 1
             continue
+    if ocean_skipped:
+        log(f"[WATER] {ocean_skipped} pièce(s) océan écartée(s) sur {len(ocean_polys)}")
 
-    masque_meshes_final = []
-    if masque_meshes:
-        masque = trimesh.util.concatenate(masque_meshes)
-        trimesh.repair.fix_normals(masque)
-        if not masque.is_watertight:
-            masque.merge_vertices()
-            trimesh.repair.fix_normals(masque)
-            trimesh.repair.fill_holes(masque)
-        masque_meshes_final = [masque]
-        log(f"[WATER] masque brut : faces={len(masque.faces)} watertight={masque.is_watertight}")
+    masque_lacs = _concatenate_watertight(masque_meshes, "WATER")
+    masque_ocean = _concatenate_watertight(ocean_meshes, "WATER-OCEAN")
 
-    ocean_meshes_final = []
-    if ocean_meshes:
-        ocean_mesh = trimesh.util.concatenate(ocean_meshes)
-        trimesh.repair.fix_normals(ocean_mesh)
-        if not ocean_mesh.is_watertight:
-            ocean_mesh.merge_vertices()
-            trimesh.repair.fix_normals(ocean_mesh)
-            trimesh.repair.fill_holes(ocean_mesh)
-        ocean_meshes_final = [ocean_mesh]
-        log(f"[WATER] masque océan : faces={len(ocean_mesh.faces)} watertight={ocean_mesh.is_watertight} sea_level_z={sea_level_z:.3f}")
+    water_polygon = unary_union(water_footprint_parts) if water_footprint_parts else None
+    return masque_lacs, masque_ocean, water_polygon
 
-    if not masque_meshes_final and not ocean_meshes_final:
-        log("[WATER] aucun masque généré")
-        return None, None
-
-    masque_lacs = masque_meshes_final[0] if masque_meshes_final else None
-    masque_ocean = ocean_meshes_final[0] if ocean_meshes_final else None
-    return masque_lacs, masque_ocean
-    
 def apply_water_boolean(masque_lacs, masque_ocean, mesh_terrain, mesh_terrain_pristine):
     if masque_lacs is None and masque_ocean is None:
         return trimesh.Trimesh(), mesh_terrain
@@ -719,7 +1309,7 @@ def apply_water_boolean(masque_lacs, masque_ocean, mesh_terrain, mesh_terrain_pr
 
     if masque_lacs is not None:
         try:
-            mesh_lacs = trimesh.boolean.intersection([mesh_terrain_pristine, masque_lacs], engine='manifold')
+            mesh_lacs = _boolean_op(trimesh.boolean.intersection, [mesh_terrain_pristine, masque_lacs], "WATER")
         except Exception as e:
             log(f"[WATER] intersection lacs échouée : {e}")
             mesh_lacs = None
@@ -744,9 +1334,17 @@ def apply_water_boolean(masque_lacs, masque_ocean, mesh_terrain, mesh_terrain_pr
 
     mesh_water = trimesh.util.concatenate(mesh_water_parts) if len(mesh_water_parts) > 1 else mesh_water_parts[0]
 
-    mesh_terrain_new = mesh_terrain
-    for masque_trou in masque_trou_parts:
-        mesh_terrain_new, terrain_ok = _gpx_safe_difference(mesh_terrain_new, masque_trou, "terrain")
+    if len(masque_trou_parts) > 1:
+        masque_trou_final = _boolean_op(trimesh.boolean.union, masque_trou_parts, "WATER")
+    else:
+        masque_trou_final = masque_trou_parts[0]
+
+    vol_before = mesh_terrain.volume
+    mesh_terrain_new, terrain_ok = _gpx_safe_difference(mesh_terrain, masque_trou_final, "terrain")
+    vol_after = mesh_terrain_new.volume
+    expected_removed = masque_trou_final.volume
+    log(f"[WATER] volume terrain : avant={vol_before:.1f} après={vol_after:.1f} "
+        f"retiré={vol_before - vol_after:.1f} (attendu≈{expected_removed:.1f})")
 
     log(f"[WATER] terrain après soustraction : faces={len(mesh_terrain_new.faces)} watertight={mesh_terrain_new.is_watertight}")
     return mesh_water, mesh_terrain_new
@@ -842,7 +1440,7 @@ def _build_ocean_bathymetric_mesh(poly, elevation, bbox, shape, z_min, sea_level
     clip_solid.apply_translation([0, 0, z_bot - 0.01])
 
     try:
-        result = trimesh.boolean.intersection([grid_mesh, clip_solid], engine='manifold')
+        result = _boolean_op(trimesh.boolean.intersection, [grid_mesh, clip_solid], "WATER")
     except Exception as e:
         log(f"[WATER] intersection bathymétrie océan échouée : {e}")
         return None
@@ -862,28 +1460,12 @@ def _build_ocean_bathymetric_mesh(poly, elevation, bbox, shape, z_min, sea_level
 
     return result
 
-def build_veg_mask(forest, other_veg, bbox, shape, mesh_terrain):
+def build_veg_mask(forest, other_veg, bbox, shape, mesh_terrain, exclude_polygon=None, extra_fill_polygon=None):
     rows, cols = shape
     z_bot = -BASE_THICKNESS + BASE_THICKNESS * (VEG_Z_BOT_RATIO_PCT / 100)
     z_top = mesh_terrain.bounds[1][2] + 1.0
 
-    def latlon_to_pixel_xy(lat, lon):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
-
-    def convert_polygon(geom):
-        if geom.geom_type != "Polygon":
-            return None
-        exterior = [latlon_to_pixel_xy(lat, lon) for lon, lat in geom.exterior.coords]
-        interiors = [[latlon_to_pixel_xy(lat, lon) for lon, lat in ring.coords] for ring in geom.interiors]
-        p = ShPoly(exterior, interiors)
-        if not p.is_valid:
-            p = p.buffer(0)
-        p = p.intersection(ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)]))
-        if not p.is_valid:
-            p = p.buffer(0)
-        return p if not p.is_empty and p.area > 0 else None
+    convert_polygon = make_polygon_projector(bbox, cols, rows)
 
     pixel_polys = []
     for dataset in [forest, other_veg]:
@@ -900,48 +1482,57 @@ def build_veg_mask(forest, other_veg, bbox, shape, mesh_terrain):
 
     log(f"[VEG] {len(pixel_polys)} polygones convertis")
 
-    if not pixel_polys:
+    has_fill = extra_fill_polygon is not None and not extra_fill_polygon.is_empty
+
+    if not pixel_polys and not has_fill:
         log("[VEG] aucun polygone, mesh vide")
-        return None
+        return None, None
 
-    merged = unary_union(pixel_polys).buffer(0.5, join_style=1).buffer(-0.3, join_style=1)
-    log(f"[VEG] après union+lissage : type={merged.geom_type}")
+    merged = unary_union(pixel_polys).buffer(0.5, join_style=1).buffer(-0.3, join_style=1) if pixel_polys else None
+    if merged is not None:
+        log(f"[VEG] après union+lissage : type={merged.geom_type}")
 
+    if exclude_polygon is not None and not exclude_polygon.is_empty and merged is not None:
+        merged = merged.difference(exclude_polygon)
+        if not merged.is_valid:
+            merged = merged.buffer(0)
+        log(f"[VEG] après exclusion routes/eau/buildings : type={merged.geom_type}")
+
+    if has_fill:
+        merged = unary_union([merged, extra_fill_polygon]) if merged is not None else extra_fill_polygon
+        merged = merged.buffer(0.5, join_style=1).buffer(-0.5, join_style=1)
+        if not merged.is_valid:
+            merged = merged.buffer(0)
+        log(f"[VEG] après ajout remplissage landcover/satellite : type={merged.geom_type}")
+
+    if merged is None or merged.is_empty:
+        log("[VEG] rien à extruder après fusion")
+        return None, None
+
+    veg_polygon = merged
     geom_list = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
 
-    masque_meshes = []
-    for poly in geom_list:
-        if not poly.is_valid or poly.area < 1.0:
-            continue
-        try:
-            m = trimesh.creation.extrude_polygon(poly, height=z_top - z_bot)
-            m.apply_translation([0, 0, z_bot])
-            masque_meshes.append(m)
-        except Exception as e:
-            log(f"[VEG] extrusion masque échouée : {e}")
-            continue
+    masque_meshes = _extrude_polygons_watertight(geom_list, z_top - z_bot, z_bot, "VEG", min_area=1.0)
 
     if not masque_meshes:
         log("[VEG] aucun masque généré")
-        return None
+        return None, None
 
-    masque = trimesh.util.concatenate(masque_meshes)
-    trimesh.repair.fix_normals(masque)
-    log(f"[VEG] masque : faces={len(masque.faces)} watertight={masque.is_watertight}")
+    masque = _concatenate_watertight(masque_meshes, "VEG")
     log(f"[VEG] masque bounds Z=[{masque.bounds[0][2]:.3f},{masque.bounds[1][2]:.3f}]")
 
     if not masque.is_watertight:
-        log("[VEG] masque non-watertight — abandon")
-        return None
+        log("[VEG] masque non-watertight même après réparation par pièce — abandon")
+        return None, None
 
-    return masque
+    return masque, veg_polygon
 
 def apply_veg_boolean(masque, mesh_terrain, mesh_terrain_pristine):
     if masque is None:
         return trimesh.Trimesh(), mesh_terrain
 
     try:
-        mesh_veg = trimesh.boolean.intersection([mesh_terrain_pristine, masque], engine='manifold')
+        mesh_veg = _boolean_op(trimesh.boolean.intersection, [mesh_terrain_pristine, masque], "VEG")
     except Exception as e:
         log(f"[VEG] intersection échouée : {e}")
         return trimesh.Trimesh(), mesh_terrain
@@ -954,7 +1545,7 @@ def apply_veg_boolean(masque, mesh_terrain, mesh_terrain_pristine):
         log(f"[VEG] faces brisées : {len(broken)}")
 
     try:
-        mesh_terrain_new = trimesh.boolean.difference([mesh_terrain, masque], engine='manifold')
+        mesh_terrain_new = _boolean_op(trimesh.boolean.difference, [mesh_terrain, masque], "VEG")
     except Exception as e:
         log(f"[VEG] soustraction terrain échouée : {e}")
         return mesh_veg, mesh_terrain
@@ -963,98 +1554,39 @@ def apply_veg_boolean(masque, mesh_terrain, mesh_terrain_pristine):
 
     return mesh_veg, mesh_terrain_new
 
-def build_trees_mesh(forest, bbox, shape, mesh_veg):
+def build_trees_mesh(forest, bbox, shape, mesh_veg, extra_fill_polygon=None):
+    if mesh_veg is None or len(mesh_veg.faces) == 0:
+        log("[TREES] pas de végétation disponible, aucun arbre généré")
+        return trimesh.Trimesh()
     rows, cols = shape
 
-    def latlon_to_pixel_xy(lat, lon):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
-
-    def convert_polygon(geom):
-        if geom.geom_type != "Polygon":
-            return None
-        exterior = [latlon_to_pixel_xy(lat, lon) for lon, lat in geom.exterior.coords]
-        interiors = [[latlon_to_pixel_xy(lat, lon) for lon, lat in ring.coords]
-                     for ring in geom.interiors]
-        p = ShPoly(exterior, interiors)
-        if not p.is_valid:
-            p = p.buffer(0)
-        p = p.intersection(ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)]))
-        if not p.is_valid:
-            p = p.buffer(0)
-        return p if not p.is_empty and p.area > 0 else None
-
-    if forest is None:
-        log("[TREES] aucune forêt, mesh vide")
-        return trimesh.Trimesh()
+    convert_polygon = make_polygon_projector(bbox, cols, rows)
 
     forest_polys = []
-    for geom in forest.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
-        for part in parts:
-            p = convert_polygon(part)
-            if p:
-                forest_polys.append(p)
+    if forest is not None:
+        for geom in forest.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+            for part in parts:
+                p = convert_polygon(part)
+                if p:
+                    forest_polys.append(p)
 
-    log(f"[TREES] {len(forest_polys)} polygones forêt")
+    log(f"[TREES] {len(forest_polys)} polygones forêt OSM")
+
+    has_fill = extra_fill_polygon is not None and not extra_fill_polygon.is_empty
+    if has_fill:
+        fill_parts = list(extra_fill_polygon.geoms) if extra_fill_polygon.geom_type == "MultiPolygon" else [extra_fill_polygon]
+        forest_polys.extend(fill_parts)
+        log(f"[TREES] +{len(fill_parts)} polygone(s) forêt landcover")
 
     if not forest_polys:
         log("[TREES] aucun polygone valide")
         return trimesh.Trimesh()
 
     merged = unary_union(forest_polys)
-
-    tree_meshes = []
-    minx, miny, maxx, maxy = merged.bounds
-    area = merged.area
-    n_trees = max(1, int(area * TREE_DENSITY / 1000))
-    log(f"[TREES] surface={area:.1f}px² → {n_trees} arbres à placer")
-
-    np.random.seed(42)
-    placed = 0
-    attempts = 0
-    max_attempts = n_trees * 20
-
-    veg_top_z = mesh_veg.bounds[1][2]
-
-    while placed < n_trees and attempts < max_attempts:
-        attempts += 1
-        x = np.random.uniform(minx, maxx)
-        y = np.random.uniform(miny, maxy)
-        if not merged.contains(Point(x, y)):
-            continue
-
-        ray_origin = np.array([[x, y, veg_top_z + 1.0]])
-        ray_dir = np.array([[0, 0, -1]])
-        locs, _, _ = mesh_veg.ray.intersects_location(ray_origin, ray_dir)
-
-        if len(locs) == 0:
-            continue
-
-        z_base = locs[:, 2].max()
-
-        cone = trimesh.creation.cone(radius=TREE_RADIUS, height=TREE_HEIGHT)
-        cone.apply_translation([x, y, z_base])
-        tree_meshes.append(cone)
-        placed += 1
-
-    log(f"[TREES] {placed} arbres placés sur {attempts} tentatives")
-
-    if not tree_meshes:
-        log("[TREES] aucun arbre généré")
-        return trimesh.Trimesh()
-
-    mesh = trimesh.util.concatenate(tree_meshes)
-    trimesh.repair.fix_normals(mesh)
-    log(f"[TREES] vertices={len(mesh.vertices)} faces={len(mesh.faces)}")
-    log(f"[TREES] watertight={mesh.is_watertight}")
-    log(f"[TREES] bounds Z=[{mesh.bounds[0][2]:.3f},{mesh.bounds[1][2]:.3f}]")
-
-    return mesh
-
+ 
 def build_monument_mesh(stl_path, rotation_deg, footprint_polygon, z_base, scale_factor=1.0):
     monument = trimesh.load(stl_path)
     if isinstance(monument, trimesh.Scene):
@@ -1092,19 +1624,17 @@ def build_monument_mesh(stl_path, rotation_deg, footprint_polygon, z_base, scale
     trimesh.repair.fix_normals(monument)
     return monument
 
-def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
+def build_buildings_mask(buildings, bbox, shape, mesh_terrain, exclude_polygon=None):
     rows, cols = shape
     z_bot = -BASE_THICKNESS + BASE_THICKNESS * (BUILDINGS_Z_BOT_RATIO_PCT / 100)
     z_top = mesh_terrain.bounds[1][2] + 1.0
 
     if buildings is None:
         log("[BUILDINGS] aucun bâtiment, mesh vide")
-        return None, []
+        return None, [], None
 
-    def latlon_to_pixel_xy(lat, lon):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
+    latlon_to_pixel_xy = make_latlon_to_pixel(bbox, cols, rows)
+    bbox_pixel = pixel_bbox_polygon(cols, rows)
 
     def convert_polygon(geom):
         if geom.geom_type != "Polygon":
@@ -1114,7 +1644,7 @@ def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
         p = ShPoly(exterior, interiors)
         if not p.is_valid:
             p = p.buffer(0)
-        p = p.intersection(ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)]))
+        p = p.intersection(bbox_pixel)
         if not p.is_valid:
             p = p.buffer(0)
         if p.is_empty:
@@ -1127,6 +1657,7 @@ def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
 
     building_meshes = []
     masque_meshes = []
+    footprint_polys = []
     skip = 0
     count = 0
 
@@ -1146,6 +1677,15 @@ def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
         for part in parts:
             polys = convert_polygon(part)
             for p in polys:
+                if exclude_polygon is not None and not exclude_polygon.is_empty:
+                    p = p.difference(exclude_polygon)
+                    if not p.is_valid:
+                        p = p.buffer(0)
+                    if p.is_empty:
+                        skip += 1
+                        continue
+                    if p.geom_type == "MultiPolygon":
+                        p = max(p.geoms, key=lambda g: g.area)
                 if p.area < 0.5:
                     skip += 1
                     continue
@@ -1159,6 +1699,7 @@ def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
                     building = trimesh.creation.extrude_polygon(p, height=height_px)
                     trimesh.repair.fix_normals(building)
                     building_meshes.append((building, masque, osm_id, p))
+                    footprint_polys.append(p)
                     count += 1
                 except Exception as e:
                     log(f"[BUILDINGS] extrusion échouée : {e}")
@@ -1169,13 +1710,14 @@ def build_buildings_mask(buildings, bbox, shape, mesh_terrain):
 
     if not masque_meshes:
         log("[BUILDINGS] aucun masque généré")
-        return None, []
+        return None, [], None
 
     masque_union = trimesh.util.concatenate(masque_meshes)
     trimesh.repair.fix_normals(masque_union)
     log(f"[BUILDINGS] masque union : faces={len(masque_union.faces)} watertight={masque_union.is_watertight}")
 
-    return masque_union, building_meshes
+    buildings_polygon = unary_union(footprint_polys) if footprint_polys else None
+    return masque_union, building_meshes, buildings_polygon
 
 def apply_buildings_boolean(masque_union, building_meshes, mesh_terrain, mesh_terrain_pristine, monument_meshes=None):
     if masque_union is None or not building_meshes:
@@ -1184,7 +1726,7 @@ def apply_buildings_boolean(masque_union, building_meshes, mesh_terrain, mesh_te
     monument_meshes = monument_meshes or {}
 
     try:
-        mesh_terrain_new = trimesh.boolean.difference([mesh_terrain, masque_union], engine='manifold')
+        mesh_terrain_new = _boolean_op(trimesh.boolean.difference, [mesh_terrain, masque_union], "BUILDINGS")
     except Exception as e:
         log(f"[BUILDINGS] soustraction terrain échouée : {e}")
         return trimesh.Trimesh(), mesh_terrain
@@ -1218,56 +1760,56 @@ def apply_buildings_boolean(masque_union, building_meshes, mesh_terrain, mesh_te
 
     return mesh_buildings, mesh_terrain_new
 
-def build_gpx_mask(gpx_points, bbox, shape, mesh_terrain):
+def apply_buildings_fill_boolean(masque, mesh_terrain, mesh_terrain_pristine):
+    if masque is None:
+        return trimesh.Trimesh(), mesh_terrain
+    try:
+        mesh_buildings_fill = _boolean_op(trimesh.boolean.intersection, [mesh_terrain_pristine, masque], "BUILDINGS-FILL")
+    except Exception as e:
+        log(f"[BUILDINGS-FILL] intersection échouée : {e}")
+        return trimesh.Trimesh(), mesh_terrain
+    log(f"[BUILDINGS-FILL] intersection terrain∩masque : faces={len(mesh_buildings_fill.faces)} watertight={mesh_buildings_fill.is_watertight}")
+    log(f"[BUILDINGS-FILL] bounds Z=[{mesh_buildings_fill.bounds[0][2]:.3f},{mesh_buildings_fill.bounds[1][2]:.3f}]")
+    try:
+        mesh_terrain_new = _boolean_op(trimesh.boolean.difference, [mesh_terrain, masque], "BUILDINGS-FILL")
+    except Exception as e:
+        log(f"[BUILDINGS-FILL] soustraction terrain échouée : {e}")
+        return mesh_buildings_fill, mesh_terrain
+    log(f"[BUILDINGS-FILL] terrain après soustraction masque : faces={len(mesh_terrain_new.faces)} watertight={mesh_terrain_new.is_watertight}")
+    log(f"[BUILDINGS-FILL] terrain Z max avant={mesh_terrain.bounds[1][2]:.4f} après={mesh_terrain_new.bounds[1][2]:.4f}")
+    return mesh_buildings_fill, mesh_terrain_new
+
+def build_gpx_mask(gpx_points, bbox, shape, mesh_terrain, clip_poly2d=None):
     rows, cols = shape
     z_bot = -BASE_THICKNESS + BASE_THICKNESS * (GPX_Z_BOT_RATIO_PCT / 100)
     z_top = mesh_terrain.bounds[1][2] + 1.0
-
-    def lonlat_to_pixel_xy(lon, lat):
-        x = (lon - bbox["west"]) / (bbox["east"] - bbox["west"]) * (cols - 1)
-        y = (lat - bbox["south"]) / (bbox["north"] - bbox["south"]) * (rows - 1)
-        return x, y
-
-    bbox_pixel = ShPoly([(0,0),(cols-1,0),(cols-1,rows-1),(0,rows-1)])
-    pixel_points = [lonlat_to_pixel_xy(lon, lat) for lon, lat in gpx_points]
+    latlon_to_pixel_xy = make_latlon_to_pixel(bbox, cols, rows)
+    bbox_pixel = pixel_bbox_polygon(cols, rows)
+    pixel_points = [latlon_to_pixel_xy(lat, lon) for lon, lat in gpx_points]
     pixel_points = [(x, y) for x, y in pixel_points if 0 <= x <= cols-1 and 0 <= y <= rows-1]
-
     if len(pixel_points) < 2:
         log("[GPX] pas assez de points dans la bbox")
         return None
-
     line = SLine(pixel_points)
-    buffered = line.buffer(GPX_WIDTH_PX, cap_style=2, join_style=2).intersection(bbox_pixel)
-
+    buffered = line.buffer(max(1.0, GPX_WIDTH_PX), cap_style=2, join_style=2).intersection(bbox_pixel)
+    if clip_poly2d is not None and clip_poly2d.is_valid and not clip_poly2d.is_empty:
+        buffered = buffered.intersection(clip_poly2d)
+        if not buffered.is_valid:
+            buffered = buffered.buffer(0)
     if buffered.is_empty or buffered.area < 0.1:
         log("[GPX] masque vide")
         return None
-
     geom_list = list(buffered.geoms) if buffered.geom_type == "MultiPolygon" else [buffered]
-
-    masque_meshes = []
-    for poly in geom_list:
-        if not poly.is_valid or poly.area < 0.1:
-            continue
-        try:
-            poly = poly.simplify(0.1, preserve_topology=True)
-            m = trimesh.creation.extrude_polygon(poly, height=z_top - z_bot)
-            m.apply_translation([0, 0, z_bot])
-            masque_meshes.append(m)
-        except Exception as e:
-            log(f"[GPX] extrusion échouée : {e}")
-
+    geom_list = [poly.simplify(0.1, preserve_topology=True) for poly in geom_list if poly.is_valid and poly.area >= 0.1]
+    masque_meshes = _extrude_polygons_watertight(geom_list, z_top - z_bot, z_bot, "GPX", min_area=0.1)
     if not masque_meshes:
         return None
-
-    masque = trimesh.util.concatenate(masque_meshes)
-    trimesh.repair.fix_normals(masque)
-    log(f"[GPX] masque : faces={len(masque.faces)} watertight={masque.is_watertight}")
-    return masque if masque.is_watertight else None
+    masque = _concatenate_watertight(masque_meshes, "GPX")
+    return masque if masque is not None and masque.is_watertight else None
 
 def _gpx_safe_difference(mesh, cutter, label):
     try:
-        result = trimesh.boolean.difference([mesh, cutter], engine='manifold')
+        result = _boolean_op(trimesh.boolean.difference, [mesh, cutter], f"GPX-{label}")
         if len(result.faces) > 0:
             trimesh.repair.fix_normals(result)
             return result, True
@@ -1279,7 +1821,7 @@ def _gpx_safe_difference(mesh, cutter, label):
         mesh_fixed = mesh.copy()
         mesh_fixed.merge_vertices()
         trimesh.repair.fix_normals(mesh_fixed)
-        result = trimesh.boolean.difference([mesh_fixed, cutter], engine='manifold')
+        result = _boolean_op(trimesh.boolean.difference, [mesh_fixed, cutter], f"GPX-{label}")
         if len(result.faces) > 0:
             trimesh.repair.fix_normals(result)
             log(f"[GPX] cut {label} : réussi après réparation")
@@ -1288,7 +1830,6 @@ def _gpx_safe_difference(mesh, cutter, label):
     except Exception as e:
         log(f"[GPX] cut {label} échoué définitivement ({e}) — mesh original conservé, "
               f"le GPX pourra être masqué à cet endroit")
-
     return mesh, False
 
 def apply_gpx_boolean(masque, mesh_terrain, mesh_terrain_pristine, other_meshes):
@@ -1300,6 +1841,7 @@ def apply_gpx_boolean(masque, mesh_terrain, mesh_terrain_pristine, other_meshes)
     except Exception as e:
         log(f"[GPX] intersection échouée : {e}")
         return trimesh.Trimesh(), mesh_terrain, other_meshes, []
+        
     mesh_gpx.apply_translation([0, 0, GPX_HEIGHT])
     trimesh.repair.fix_normals(mesh_gpx)
 
@@ -1332,12 +1874,10 @@ def parse_gpx_file(path, bbox):
             points.append((lon, lat))
     return points
 
-def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
-                          tab_right, tab_left, tab_top, tab_bot):
-    r = min(cell_w, cell_h) * 0.14
+def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,tab_right, tab_left, tab_top, tab_bot, tab_radius_ratio=0.14):
+    r = min(cell_w, cell_h) * tab_radius_ratio
     n = 40
     pts = []
-
     xc = (cx0 + cx1) / 2
     if tab_bot is None:
         pts += [(cx0, cy0), (cx1, cy0)]
@@ -1353,11 +1893,10 @@ def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
         pts += [(cx0, cy0)]
         for i in range(8): pts.append((cx0 + i/7*(xc-r-cx0), cy0))
         for i in range(n+1):
-            a = -math.pi*i/n
-            pts.append((xc + r*math.cos(a), cy0 + r*math.sin(a)))
+            a = -math.pi*(n-i)/n
+            pts.append((xc + r*math.cos(a), cy0 - r*math.sin(a)))
         for i in range(8): pts.append((xc+r + i/7*(cx1-(xc+r)), cy0))
         pts += [(cx1, cy0)]
-
     yc = (cy0 + cy1) / 2
     if tab_right is None:
         pts += [(cx1, cy1)]
@@ -1374,25 +1913,23 @@ def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
             pts.append((cx1 + r*math.cos(a), yc + r*math.sin(a)))
         for i in range(8): pts.append((cx1, yc+r + i/7*(cy1-(yc+r))))
     pts += [(cx1, cy1)]
-
     xc = (cx0 + cx1) / 2
     if tab_top is None:
         pts += [(cx0, cy1)]
     elif tab_top:
         for i in range(8): pts.append((cx1 - i/7*(cx1-(xc+r)), cy1))
         for i in range(n+1):
-            a = math.pi*i/n
+            a = math.pi*(n-i)/n
             pts.append((xc + r*math.cos(math.pi - a), cy1 + r*math.sin(math.pi - a)))
         for i in range(8): pts.append((xc-r - i/7*(xc-r-cx0), cy1))
         pts += [(cx0, cy1)]
     else:
         for i in range(8): pts.append((cx1 - i/7*(cx1-(xc+r)), cy1))
         for i in range(n+1):
-            a = math.pi*i/n
+            a = math.pi*(n-i)/n
             pts.append((xc + r*math.cos(math.pi - a), cy1 - r*math.sin(math.pi - a)))
         for i in range(8): pts.append((xc-r - i/7*(xc-r-cx0), cy1))
         pts += [(cx0, cy1)]
-
     yc = (cy0 + cy1) / 2
     if tab_left is None:
         pts += [(cx0, cy0)]
@@ -1410,145 +1947,397 @@ def _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
             pts.append((cx0 + r*math.cos(a), yc + r*math.sin(a)))
         for i in range(8): pts.append((cx0, yc-r - i/7*(yc-r-cy0)))
         pts += [(cx0, cy0)]
-
     from shapely.geometry import Polygon as ShPoly
     poly = ShPoly(pts)
     if not poly.is_valid:
         poly = poly.buffer(0)
     return poly
 
-def build_puzzle_pieces(mesh_terrain, n_pieces, extra_meshes=None):
+def build_puzzle_pieces(mesh_terrain, n_pieces, extra_meshes=None, merge_small_pieces=True, tab_radius_ratio=0.14):
+
     bounds = mesh_terrain.bounds
     x_min, y_min = bounds[0][0], bounds[0][1]
     x_max, y_max = bounds[1][0], bounds[1][1]
     z_min, z_max = bounds[0][2], bounds[1][2]
-
     n_cols = math.ceil(math.sqrt(n_pieces))
     n_rows = math.ceil(n_pieces / n_cols)
-
     cell_w = (x_max - x_min) / n_cols
     cell_h = (y_max - y_min) / n_rows
     z_height = z_max - z_min + 4.0
-
+    r = min(cell_w, cell_h) * tab_radius_ratio
     tab_x = {col: (col % 2 == 1) for col in range(1, n_cols)}
     tab_y = {row: (row % 2 == 1) for row in range(1, n_rows)}
 
-    pieces = []
+    cells = {}
     for row in range(n_rows):
         for col in range(n_cols):
             idx = row * n_cols + col
             if idx >= n_pieces:
-                break
-
+                continue
             cx0 = x_min + col * cell_w
             cx1 = cx0 + cell_w
             cy0 = y_min + row * cell_h
             cy1 = cy0 + cell_h
-
             right = None if (col == n_cols-1 or idx+1 >= n_pieces) else (not tab_x[col+1])
             left  = None if col == 0 else tab_x[col]
             top   = None if (row == n_rows-1 or idx+n_cols >= n_pieces) else (not tab_y[row+1])
             bot   = None if row == 0 else tab_y[row]
+            cells[(row, col)] = {
+                "cx0": cx0, "cx1": cx1, "cy0": cy0, "cy1": cy1,
+                "right": right, "left": left, "top": top, "bot": bot,
+            }
 
-            poly2d = _puzzle_cell_polygon(cx0, cx1, cy0, cy1, cell_w, cell_h,
-                                          right, left, top, bot)
-            if poly2d.is_empty or poly2d.area < 1:
-                continue
+    opposite = {"right": "left", "left": "right", "top": "bot", "bot": "top"}
 
+    def neighbor_key(key, direction):
+        row, col = key
+        if direction == "right":
+            return (row, col + 1)
+        if direction == "left":
+            return (row, col - 1)
+        if direction == "top":
+            return (row + 1, col)
+        if direction == "bot":
+            return (row - 1, col)
+        return None
+
+    flatten_sides = {}
+
+    def flatten_both_sides(key, direction, reason):
+        flatten_sides.setdefault(key, set()).add(direction)
+        nk = neighbor_key(key, direction)
+        if nk in cells:
+            flatten_sides.setdefault(nk, set()).add(opposite[direction])
+            log(f"[PUZZLE] aplatissement '{direction}' sur {key} ET '{opposite[direction]}' sur {nk} ({reason})")
+
+    is_small = {}
+    if merge_small_pieces:
+        min_extent = r * 4
+        min_volume_ratio = 0.10
+        for key, c in cells.items():
+            rect = box(c["cx0"], c["cy0"], c["cx1"], c["cy1"])
             try:
-                mask = trimesh.creation.extrude_polygon(poly2d, height=z_height)
+                mask = trimesh.creation.extrude_polygon(rect, height=z_height)
                 mask.apply_translation([0, 0, z_min - 2])
-            except Exception as e:
-                log(f"[PUZZLE] masque ({row},{col}) échoué: {e}")
+                footprint = trimesh.boolean.intersection([mesh_terrain, mask], engine='manifold')
+            except Exception:
+                footprint = None
+            if footprint is None or len(footprint.faces) == 0:
+                is_small[key] = True
                 continue
+            fb = footprint.bounds
+            span_x = fb[1][0] - fb[0][0]
+            span_y = fb[1][1] - fb[0][1]
+            volume_ratio = footprint.volume / mask.volume if mask.volume > 0 else 0.0
+            too_small = span_x < min_extent or span_y < min_extent or volume_ratio < min_volume_ratio
+            is_small[key] = too_small
+            if too_small:
+                log(f"[PUZZLE] cellule {key} trop petite (span=({span_x:.1f},{span_y:.1f}), ratio_volume={volume_ratio:.2f}) — fusion prévue")
+    else:
+        is_small = {key: False for key in cells}
 
-            piece_meshes = []
+    merge_target = {}
+    for key in list(cells.keys()):
+        if not is_small.get(key):
+            continue
+        row, col = key
+        candidates = [
+            ((row, col + 1), "right", "left"),
+            ((row, col - 1), "left", "right"),
+            ((row + 1, col), "top", "bot"),
+            ((row - 1, col), "bot", "top"),
+        ]
+        target = None
+        for cand_key, self_side, target_side in candidates:
+            if cand_key in cells and not is_small.get(cand_key):
+                target = (cand_key, self_side, target_side)
+                break
+        if target is None:
+            for cand_key, self_side, target_side in candidates:
+                if cand_key in cells and cand_key != key:
+                    target = (cand_key, self_side, target_side)
+                    break
+        if target is not None:
+            merge_target[key] = target
 
-            try:
-                terrain_piece = trimesh.boolean.intersection([mesh_terrain, mask], engine='manifold')
-                if terrain_piece is not None and len(terrain_piece.faces) > 0:
-                    if terrain_piece.volume > mesh_terrain.volume * 0.0001:
-                        piece_meshes.append(terrain_piece)
-            except Exception as e:
-                log(f"[PUZZLE] terrain pièce ({row},{col}) échoué: {e}")
+    def resolve_root(key):
+        seen = set()
+        while key in merge_target and key not in seen:
+            seen.add(key)
+            key = merge_target[key][0]
+        return key
+
+    absorbed_by = {}
+    for small_key, (target_key, self_side, target_side) in merge_target.items():
+        root_key = resolve_root(target_key)
+        absorbed_by.setdefault(root_key, []).append((small_key, self_side))
+        flatten_sides.setdefault(small_key, set()).add(self_side)
+        flatten_sides.setdefault(root_key, set()).add(target_side)
+
+    edge_len = {"right": cell_h, "left": cell_h, "top": cell_w, "bot": cell_w}
+    for root_key, members in absorbed_by.items():
+        group_keys = [root_key] + [m[0] for m in members]
+        by_direction = {"right": [], "left": [], "top": [], "bot": []}
+        for gk in group_keys:
+            c = cells[gk]
+            for direction in ("right", "left", "top", "bot"):
+                if direction in flatten_sides.get(gk, ()):
+                    continue
+                if c[direction] is not None:
+                    by_direction[direction].append(gk)
+        for direction, keys_with_feature in by_direction.items():
+            if len(keys_with_feature) > 1:
+                keys_with_feature.sort(key=lambda k: edge_len[direction], reverse=True)
+                for extra_key in keys_with_feature[1:]:
+                    flatten_both_sides(extra_key, direction, "doublon apres fusion")
+
+    def get_sides(key):
+        c = cells[key]
+        sides = dict(right=c["right"], left=c["left"], top=c["top"], bot=c["bot"])
+        for flat_side in flatten_sides.get(key, ()):
+            sides[flat_side] = None
+        return sides
+
+    def build_group_polygon(root_key):
+        c = cells[root_key]
+        sides = get_sides(root_key)
+        poly2d = _puzzle_cell_polygon(c["cx0"], c["cx1"], c["cy0"], c["cy1"], cell_w, cell_h,
+                                      sides["right"], sides["left"], sides["top"], sides["bot"], tab_radius_ratio)
+        for small_key, _ in absorbed_by.get(root_key, []):
+            sc = cells[small_key]
+            small_sides = get_sides(small_key)
+            small_poly = _puzzle_cell_polygon(sc["cx0"], sc["cx1"], sc["cy0"], sc["cy1"], cell_w, cell_h,
+                                              small_sides["right"], small_sides["left"], small_sides["top"], small_sides["bot"], tab_radius_ratio)
+            poly2d = unary_union([poly2d, small_poly])
+        return poly2d, sides
+
+    def build_mask_and_terrain(poly, key):
+        try:
+            m = trimesh.creation.extrude_polygon(poly, height=z_height)
+            m.apply_translation([0, 0, z_min - 2])
+        except Exception as e:
+            log(f"[PUZZLE] masque {key} échoué: {e}")
+            return None, None
+        try:
+            tp_mesh = trimesh.boolean.intersection([mesh_terrain, m], engine='manifold')
+        except Exception as e:
+            log(f"[PUZZLE] terrain pièce {key} échoué: {e}")
+            return m, None
+        return m, tp_mesh
+
+    r_probe = r
+    min_probe_volume_ratio = 0.02
+    reference_probe_volume = r_probe * r_probe * (z_max - z_min)
+
+    def probe_material(mesh_piece, direction, c):
+        cx0, cx1, cy0, cy1 = c["cx0"], c["cx1"], c["cy0"], c["cy1"]
+        xc, yc = (cx0 + cx1) / 2, (cy0 + cy1) / 2
+        centers = {
+            "right": (cx1 + r_probe / 2, yc),
+            "left": (cx0 - r_probe / 2, yc),
+            "top": (xc, cy1 + r_probe / 2),
+            "bot": (xc, cy0 - r_probe / 2),
+        }
+        px, py = centers[direction]
+        probe_box = trimesh.creation.box(extents=[r_probe * 1.5, r_probe * 1.5, z_height])
+        probe_box.apply_translation([px, py, z_min - 2 + z_height / 2])
+        try:
+            hit = trimesh.boolean.intersection([mesh_piece, probe_box], engine='manifold')
+            return hit.volume if hit is not None and len(hit.faces) > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    root_keys = [key for key in cells if key not in merge_target]
+
+    for root_key in root_keys:
+        poly2d, sides = build_group_polygon(root_key)
+        if poly2d.is_empty or poly2d.area < 1:
+            continue
+        _, terrain_piece = build_mask_and_terrain(poly2d, root_key)
+        if terrain_piece is None or len(terrain_piece.faces) == 0:
+            continue
+        c = cells[root_key]
+        for direction in ("right", "left", "top", "bot"):
+            if sides[direction] is not True:
                 continue
+            vol = probe_material(terrain_piece, direction, c)
+            if vol < reference_probe_volume * min_probe_volume_ratio:
+                flatten_both_sides(root_key, direction, f"tenon trop petit (volume={vol:.1f})")
 
-            if not piece_meshes:
-                continue
-
-            if extra_meshes:
-                for extra in extra_meshes:
-                    if extra is None or len(extra.faces) == 0:
-                        continue
-                    try:
-                        ep = trimesh.boolean.intersection([extra, mask], engine='manifold')
-                        if ep is not None and len(ep.faces) > 0:
-                            piece_meshes.append(ep)
-                    except Exception:
-                        pass
-
-            piece = trimesh.util.concatenate(piece_meshes) if len(piece_meshes) > 1 else piece_meshes[0]
-            log(f"[PUZZLE] pièce ({row},{col}): faces={len(piece.faces)} watertight={piece.is_watertight}")
-            pieces.append(piece)
-
+    pieces = []
+    for root_key in root_keys:
+        poly2d, sides = build_group_polygon(root_key)
+        if poly2d.is_empty or poly2d.area < 1:
+            continue
+        mask, terrain_piece = build_mask_and_terrain(poly2d, root_key)
+        if terrain_piece is None or len(terrain_piece.faces) == 0 or terrain_piece.volume <= mesh_terrain.volume * 0.0001:
+            continue
+        piece_layers = {"terrain": terrain_piece}
+        if extra_meshes:
+            for name, extra in extra_meshes:
+                if extra is None or len(extra.faces) == 0:
+                    continue
+                try:
+                    ep = trimesh.boolean.intersection([extra, mask], engine='manifold')
+                    if ep is not None and len(ep.faces) > 0:
+                        piece_layers[name] = ep
+                except Exception:
+                    pass
+        total_faces = sum(len(m.faces) for m in piece_layers.values())
+        log(f"[PUZZLE] pièce {root_key}: faces={total_faces} layers={list(piece_layers.keys())}")
+        pieces.append(piece_layers)
     return pieces
 
-def export_puzzle_3mf(pieces, output_path):
+def export_puzzle_3mf(pieces, output_path, plate_size=256, puzzle_gap_mm=5.0):
+    LAYER_COLORS = {
+        "terrain":    "#FFFFFF",
+        "roads":      "#000000",
+        "water":      "#0094FF",
+        "vegetation": "#00D921",
+        "trees":      "#006921",
+        "buildings":  "#898989",
+    }
+
+    piece_centers = []
+    for layers in pieces:
+        all_verts = np.vstack([mesh.vertices for mesh in layers.values()])
+        piece_centers.append(all_verts[:, :2].mean(axis=0))
+    global_center = np.mean(piece_centers, axis=0)
+
+    leaves = []
+    piece_leaf_ids = []
+    for i, layers in enumerate(pieces):
+        direction = piece_centers[i] - global_center
+        norm = np.linalg.norm(direction)
+        offset_xy = direction / norm * puzzle_gap_mm if norm > 1e-6 else np.zeros(2)
+        ids_for_piece = []
+        for name, mesh in layers.items():
+            color = LAYER_COLORS.get(name, "#FF0000" if name.startswith("gpx_") else "#888888")
+            exploded = mesh.copy()
+            exploded.apply_translation([offset_xy[0], offset_xy[1], 0])
+            leaves.append((f"piece{i}_{name}", exploded, color))
+            ids_for_piece.append(len(leaves))
+        piece_leaf_ids.append(ids_for_piece)
+
+    all_bounds = np.array([m.bounds for _, m, _ in leaves])
+    global_min = all_bounds[:, 0, :].min(axis=0)
+    global_max = all_bounds[:, 1, :].max(axis=0)
+    item_x = plate_size / 2 - (global_min[0] + global_max[0]) / 2
+    item_y = plate_size / 2 - (global_min[1] + global_max[1]) / 2
+    item_z = -global_min[2]
+    item_transform = f"1 0 0 0 1 0 0 0 1 {item_x:.6f} {item_y:.6f} {item_z:.6f}"
+
+    obj_model_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<metadata name="BambuStudio:3mfVersion">1</metadata>',
+        '<resources>'
+    ]
+    for i, (label, mesh, _) in enumerate(leaves):
+        obj_model_lines.append(f'<object id="{i+1}" type="model" p:UUID="{uuid.uuid4()}"><mesh><vertices>')
+        for v in mesh.vertices:
+            obj_model_lines.append(f'<vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>')
+        obj_model_lines.append('</vertices><triangles>')
+        for f in mesh.faces:
+            obj_model_lines.append(f'<triangle v1="{f[0]}" v2="{f[1]}" v3="{f[2]}"/>')
+        obj_model_lines.append('</triangles></mesh></object>')
+    obj_model_lines.append('</resources></model>')
+
+    n_leaves = len(leaves)
+    n_pieces = len(pieces)
+    piece_obj_ids = [n_leaves + i + 1 for i in range(n_pieces)]
+
+    main_model_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<metadata name="Application">BambuStudio-02.06.00.51</metadata>',
+        '<metadata name="BambuStudio:3mfVersion">1</metadata>',
+        '<resources>'
+    ]
+    for i in range(n_pieces):
+        piece_uuid = str(uuid.uuid4())
+        main_model_lines.append(f'<object id="{piece_obj_ids[i]}" type="model" p:UUID="{piece_uuid}"><components>')
+        for leaf_id in piece_leaf_ids[i]:
+            main_model_lines.append(f'<component p:path="/3D/Objects/object_1.model" objectid="{leaf_id}" p:UUID="{uuid.uuid4()}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>')
+        main_model_lines.append('</components></object>')
+    main_model_lines.append('</resources>')
+
+    build_uuid = str(uuid.uuid4())
+    main_model_lines.append(f'<build p:UUID="{build_uuid}">')
+    for oid in piece_obj_ids:
+        main_model_lines.append(f'<item objectid="{oid}" p:UUID="{uuid.uuid4()}" transform="{item_transform}" printable="1"/>')
+    main_model_lines.append('</build></model>')
+
+    model_settings_lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<config>']
+    filament_colors = []
+    for i in range(n_pieces):
+        model_settings_lines.append(f'<object id="{piece_obj_ids[i]}">')
+        model_settings_lines.append(f'<metadata key="name" value="piece_{i}"/>')
+        model_settings_lines.append('<metadata key="extruder" value="1"/>')
+        for leaf_id in piece_leaf_ids[i]:
+            label, _, color = leaves[leaf_id - 1]
+            filament_colors.append(color)
+            model_settings_lines += [
+                f'<part id="{leaf_id}" subtype="normal_part">',
+                f'<metadata key="name" value="{label}"/>',
+                f'<metadata key="extruder" value="{leaf_id}"/>',
+                '</part>'
+            ]
+        model_settings_lines.append('</object>')
+    model_settings_lines.append('<plate>')
+    model_settings_lines.append('<metadata key="plater_id" value="1"/>')
+    model_settings_lines.append('<metadata key="plater_name" value=""/>')
+    model_settings_lines.append('<metadata key="locked" value="false"/>')
+    model_settings_lines.append('<metadata key="thumbnail_file" value="Metadata/plate_1.png"/>')
+    for i, oid in enumerate(piece_obj_ids):
+        model_settings_lines.append('<model_instance>')
+        model_settings_lines.append(f'<metadata key="object_id" value="{oid}"/>')
+        model_settings_lines.append('<metadata key="instance_id" value="0"/>')
+        model_settings_lines.append('</model_instance>')
+    model_settings_lines.append('</plate>')
+    model_settings_lines.append('<assemble>')
+    for i, oid in enumerate(piece_obj_ids):
+        model_settings_lines.append(f'<assemble_item object_id="{oid}" instance_id="0" transform="1 0 0 0 1 0 0 0 1 0 0 0" offset="0 0 0"/>')
+    model_settings_lines.append('</assemble>')
+    model_settings_lines.append('</config>')
+
+    n = len(filament_colors)
+    filament_settings = json.dumps({
+        "filament_colour": filament_colors,
+        "default_filament_colour": [""] * n,
+        "filament_colour_type": ["1"] * n,
+        "filament_settings_id": ["Bambu PLA Basic @BBL A1M"] * n,
+        "filament_type": ["PLA"] * n,
+        "filament_vendor": ["Bambu Lab"] * n,
+    }, indent=2)
+    rels_main = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>'
+    rels_obj = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/Objects/object_1.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>'
+    types = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>'
 
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
-</Types>''')
-        zf.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="/3D/3dmodel.model"/>
-</Relationships>''')
+        zf.writestr('3D/Objects/object_1.model', '\n'.join(obj_model_lines))
+        zf.writestr('3D/3dmodel.model', '\n'.join(main_model_lines))
+        zf.writestr('3D/_rels/3dmodel.model.rels', rels_obj)
+        zf.writestr('_rels/.rels', rels_main)
+        zf.writestr('[Content_Types].xml', types)
+        zf.writestr('Metadata/model_settings.config', '\n'.join(model_settings_lines))
+        zf.writestr('Metadata/project_settings.config', filament_settings)
+        zf.writestr('Metadata/filaments_colors.json', filament_settings)
+        zf.writestr('Metadata/filament_sequence.json', '{"plate_1":{"nozzle_sequence":[],"optimal_assignment":[],"sequence":[]}}')
 
-        objects_xml = ""
-        build_items = ""
-        for i, piece in enumerate(pieces):
-            oid = i + 1
-            verts = piece.vertices
-            faces = piece.faces
-            vertices_xml = "".join(
-                f'<vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>'
-                for v in verts
-            )
-            triangles_xml = "".join(
-                f'<triangle v1="{f[0]}" v2="{f[1]}" v3="{f[2]}"/>'
-                for f in faces
-            )
-            objects_xml += f'''<object id="{oid}" type="model" name="piece_{i}">
-  <mesh>
-    <vertices>{vertices_xml}</vertices>
-    <triangles>{triangles_xml}</triangles>
-  </mesh>
-</object>'''
-            build_items += f'<item objectid="{oid}"/>'
+    log(f"[PUZZLE] exporté {n_pieces} pièces ({n_leaves} objets colorés) → {output_path}")
 
-        model_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
-  <resources>{objects_xml}</resources>
-  <build>{build_items}</build>
-</model>'''
-
-        zf.writestr("3D/3dmodel.model", model_xml)
-
-    log(f"[PUZZLE] exporté {len(pieces)} pièces → {output_path}")
-
-def save_mesh(mesh, output_path):
+def save_mesh(mesh, output_path, name):
     if os.path.dirname(output_path):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
     broken = trimesh.repair.broken_faces(mesh)
     mesh.export(output_path)
     if len(broken) > 0:
-        log(f"[AVERT] {len(broken)} faces brisées")
+        log(f"[AVERT] [{name}] {len(broken)} faces brisées")
     else:
-        log(f"[OK] aucune face brisée")
+        log(f"[OK] [{name}] aucune face brisée")
 
-def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
+def save_3mf(meshes, stl_paths, output_path, gpx_list=None, plate_size=180):
     LAYER_COLORS = {
         "terrain_base.stl":       "#FFFFFF",
         "terrain_roads.stl":      "#000000",
@@ -1557,10 +2346,6 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
         "terrain_trees.stl":      "#006921",
         "terrain_buildings.stl":  "#898989",
     }
-
-    def hex_to_rgb(h):
-        h = h.lstrip("#")
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
     meshes_data = [(os.path.basename(p), m) for m, p in zip(meshes, stl_paths) if len(m.faces) > 0]
 
@@ -1579,9 +2364,17 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
             LAYER_COLORS[fname] = gpx.get("color", "#FF0000")
             meshes_data.append((fname, mesh))
 
+    all_bounds = np.array([m.bounds for _, m in meshes_data])
+    global_min = all_bounds[:, 0, :].min(axis=0)
+    global_max = all_bounds[:, 1, :].max(axis=0)
+    item_x = plate_size / 2 - (global_min[0] + global_max[0]) / 2
+    item_y = plate_size / 2 - (global_min[1] + global_max[1]) / 2
+    item_z = -global_min[2]
+
     obj_model_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<metadata name="BambuStudio:3mfVersion">1</metadata>',
         '<resources>'
     ]
     for i, (fname, mesh) in enumerate(meshes_data):
@@ -1598,22 +2391,26 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
     main_uuid = str(uuid.uuid4())
     main_model_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">',
+        '<metadata name="Application">BambuStudio-02.06.00.51</metadata>',
+        '<metadata name="BambuStudio:3mfVersion">1</metadata>',
         '<resources>',
         f'<object id="{main_obj_id}" type="model" p:UUID="{main_uuid}">',
         '<components>'
     ]
     for i, (fname, _) in enumerate(meshes_data):
         main_model_lines.append(f'<component p:path="/3D/Objects/object_1.model" objectid="{i+1}" p:UUID="{uuid.uuid4()}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>')
-    main_model_lines += ['</components></object>', '</resources>', f'<build><item objectid="{main_obj_id}"/></build>', '</model>']
+    build_uuid = str(uuid.uuid4())
+    item_uuid = str(uuid.uuid4())
+    item_transform = f"1 0 0 0 1 0 0 0 1 {item_x:.6f} {item_y:.6f} {item_z:.6f}"
+    main_model_lines += ['</components></object>', '</resources>', f'<build p:UUID="{build_uuid}"><item objectid="{main_obj_id}" p:UUID="{item_uuid}" transform="{item_transform}" printable="1"/></build>', '</model>']
 
     model_settings_lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<config>', f'<object id="{main_obj_id}">',
                             f'<metadata key="name" value="topopixel"/>', f'<metadata key="extruder" value="1"/>']
     filament_colors = []
     for i, (fname, _) in enumerate(meshes_data):
-        color_hex = LAYER_COLORS.get(fname, "#888888")
-        r, g, b = hex_to_rgb(color_hex)
-        filament_colors.append(f'#{r:02X}{g:02X}{b:02X}FF')
+        color_hex = LAYER_COLORS.get(fname, "#888888").lstrip("#")[:6]
+        filament_colors.append(f'#{color_hex.upper()}')
         label = fname.replace("terrain_", "").replace(".stl", "")
         model_settings_lines += [
             f'<part id="{i+1}" subtype="normal_part">',
@@ -1622,9 +2419,33 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
             f'<metadata key="source_file" value="{fname}"/>',
             '</part>'
         ]
-    model_settings_lines += ['</object>', '</config>']
+    model_settings_lines += [
+        '</object>',
+        '<plate>',
+        '<metadata key="plater_id" value="1"/>',
+        '<metadata key="plater_name" value=""/>',
+        '<metadata key="locked" value="false"/>',
+        '<metadata key="thumbnail_file" value="Metadata/plate_1.png"/>',
+        '<model_instance>',
+        f'<metadata key="object_id" value="{main_obj_id}"/>',
+        '<metadata key="instance_id" value="0"/>',
+        '</model_instance>',
+        '</plate>',
+        '<assemble>',
+        f'<assemble_item object_id="{main_obj_id}" instance_id="0" transform="1 0 0 0 1 0 0 0 1 0 0 0" offset="0 0 0"/>',
+        '</assemble>',
+        '</config>'
+    ]
 
-    filament_settings = '{\n    "filament_colour": ' + str(filament_colors).replace("'", '"') + '\n}'
+    n = len(filament_colors)
+    filament_settings = json.dumps({
+        "filament_colour": filament_colors,
+        "default_filament_colour": [""] * n,
+        "filament_colour_type": ["1"] * n,
+        "filament_settings_id": ["Bambu PLA Basic @BBL A1M"] * n,
+        "filament_type": ["PLA"] * n,
+        "filament_vendor": ["Bambu Lab"] * n,
+    }, indent=2)
     rels_main = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>'
     rels_obj = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/Objects/object_1.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>'
     types = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>'
@@ -1638,9 +2459,10 @@ def save_3mf(meshes, stl_paths, output_path, gpx_list=None):
         zf.writestr('Metadata/model_settings.config', '\n'.join(model_settings_lines))
         zf.writestr('Metadata/project_settings.config', filament_settings)
         zf.writestr('Metadata/filaments_colors.json', filament_settings)
+        zf.writestr('Metadata/filament_sequence.json', '{"plate_1":{"nozzle_sequence":[],"optimal_assignment":[],"sequence":[]}}')
 
     log(f"[3MF] exporté : {output_path}")
-
+    
 def add_anchor(mesh, cols, rows):
     anchor = trimesh.creation.box(extents=[0.001, 0.001, 0.001])
     anchor.apply_translation([0, 0, 0])
@@ -1663,6 +2485,22 @@ def _parse_osm_cache_bbox(fname):
     data_type, s, n, w, e = m.groups()
     return {"data_type": data_type, "south": float(s), "north": float(n), "west": float(w), "east": float(e)}
 
+def _parse_satellite_cache_bbox(fname):
+    m = re.match(r".*_crop_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)_([+-]?\d+\.\d+)\.tif$", fname)
+    if not m:
+        return None
+    west, south, east, north = (float(g) for g in m.groups())
+    return {"west": west, "south": south, "east": east, "north": north}
+
+def _parse_landcover_cache_bbox(fname):
+    m = re.match(r".*_([NS])(\d{2})([EW])(\d{3})_MAP\.tif$", fname)
+    if not m:
+        return None
+    ns, lat_str, ew, lon_str = m.groups()
+    lat = int(lat_str) * (1 if ns == "N" else -1)
+    lon = int(lon_str) * (1 if ew == "E" else -1)
+    return {"west": lon, "south": lat, "east": lon + 3, "north": lat + 3}
+
 def _osm_cache_load(bbox, data_type, cache_dir=CACHE_DIR):
     osm_dir = os.path.join(cache_dir, "osm")
     if not os.path.isdir(osm_dir):
@@ -1682,22 +2520,23 @@ def _osm_cache_load(bbox, data_type, cache_dir=CACHE_DIR):
             fpath = os.path.join(osm_dir, fname)
             with open(fpath, "rb") as f:
                 data = pickle.load(f)
-            return _osm_cache_clip(data, bbox)
+            return _osm_cache_clip(data, bbox, _OSM_CACHE_SUBLABELS.get(data_type))
     log(f"[OSM CACHE] miss : {data_type}")
     return None
 
-def _osm_cache_clip(data, bbox):
+def _osm_cache_clip(data, bbox, labels=None):
     if data is None:
         return None
     if isinstance(data, tuple):
         return tuple(
-            _osm_cache_clip(d, bbox) if d is not None else None
-            for d in data
+            _osm_cache_clip(d, bbox, labels[i] if isinstance(labels, list) and i < len(labels) else None)
+            for i, d in enumerate(data)
         )
     try:
         if isinstance(data, gpd.GeoDataFrame) and len(data) > 0:
             clipped = data.cx[bbox["west"]:bbox["east"], bbox["south"]:bbox["north"]]
-            log(f"[OSM CACHE] clip : {len(data)} → {len(clipped)} features")
+            tag = f" {labels}" if isinstance(labels, str) else ""
+            log(f"[OSM CACHE] clip{tag} : {len(data)} → {len(clipped)} features")
             return clipped
     except Exception:
         pass
@@ -1761,10 +2600,10 @@ def download_osm_all(bbox, cache_dir=CACHE_DIR):
     cached_buildings = _osm_cache_load(bbox, "buildings", cache_dir)
 
     if cached_water is not None and cached_veg is not None and cached_buildings is not None:
-        water_areas, waterways = cached_water
+        water_areas, waterways, coastlines = cached_water
         forest, other_veg = cached_veg
         return {
-            "water": {"water_areas": water_areas, "waterways": waterways},
+            "water": {"water_areas": water_areas, "waterways": waterways, "coastlines": coastlines},
             "vegetation": {"forest": forest, "other_veg": other_veg},
             "buildings": {"buildings": cached_buildings},
         }
@@ -2105,7 +2944,6 @@ if __name__ == "__main__":
     parser.add_argument("lat", type=float, help="Latitude du centre")
     parser.add_argument("lon", type=float, help="Longitude du centre")
 
-    # --- Emprise ---
     parser.add_argument("--shape", choices=["rect", "circle", "hexagon", "polygon"], default="rect",
                          help="Forme de découpe du modèle")
     parser.add_argument("--radius", type=float, default=RADIUS_M,
@@ -2113,13 +2951,11 @@ if __name__ == "__main__":
     parser.add_argument("--polygon", nargs="+", default=None,
                          help="Points du polygone 'lon,lat lon,lat ...' (requis si --shape polygon)")
 
-    # --- DEM / échelle ---
     parser.add_argument("--resolution", type=float, default=RESOLUTION_M, help="Résolution DEM (m/px)")
     parser.add_argument("--size-mm", type=float, default=SIZE_MM, help="Taille du modèle en mm")
     parser.add_argument("--base-thickness", type=float, default=BASE_THICKNESS, help="Épaisseur du socle")
     parser.add_argument("--z-scale", type=float, default=Z_SCALE, help="Facteur d'exagération verticale")
 
-    # --- Couches ---
     parser.add_argument("--layers", nargs="+",
                          default=["terrain", "roads", "water", "vegetation", "trees", "buildings"],
                          choices=["terrain", "roads", "water", "vegetation", "trees", "buildings", "gpx"],
@@ -2127,26 +2963,22 @@ if __name__ == "__main__":
     parser.add_argument("--railways", action="store_true", help="Inclure les voies ferrées")
     parser.add_argument("--bathymetry", action="store_true", help="Activer la bathymétrie")
 
-    # --- Routes ---
     parser.add_argument("--road-width", type=float, default=ROAD_WIDTH_PX, help="Largeur des routes (px)")
     parser.add_argument("--road-height", type=float, default=ROAD_HEIGHT, help="Hauteur des routes")
     parser.add_argument("--roads-z-bot-pct", type=float, default=ROADS_Z_BOT_RATIO_PCT, help="Ratio Z bas routes (%%)")
 
-    # --- Eau ---
     parser.add_argument("--river-width", type=float, default=RIVER_WIDTH_PX, help="Largeur cours d'eau (px)")
     parser.add_argument("--water-height", type=float, default=WATER_HEIGHT, help="Hauteur de l'eau")
     parser.add_argument("--min-water-area", type=float, default=MIN_WATER_AREA_M2, help="Aire min. plan d'eau (m²)")
     parser.add_argument("--min-waterway-length", type=float, default=MIN_WATERWAY_LENGTH_M, help="Longueur min. cours d'eau (m)")
     parser.add_argument("--water-z-bot-pct", type=float, default=WATER_Z_BOT_RATIO_PCT, help="Ratio Z bas eau (%%)")
 
-    # --- Végétation ---
     parser.add_argument("--min-veg-area", type=float, default=MIN_VEG_AREA_M2, help="Aire min. végétation (m²)")
     parser.add_argument("--veg-z-bot-pct", type=float, default=VEG_Z_BOT_RATIO_PCT, help="Ratio Z bas végétation (%%)")
     parser.add_argument("--tree-height", type=float, default=TREE_HEIGHT, help="Hauteur des arbres")
     parser.add_argument("--tree-radius", type=float, default=TREE_RADIUS, help="Rayon des arbres")
     parser.add_argument("--tree-density", type=float, default=TREE_DENSITY, help="Densité des arbres")
 
-    # --- Bâtiments ---
     parser.add_argument("--min-building-area", type=float, default=MIN_BUILDING_AREA_M2, help="Aire min. bâtiment (m²)")
     parser.add_argument("--default-building-height", type=float, default=DEFAULT_BUILDING_HEIGHT_M, help="Hauteur bâtiment par défaut")
     parser.add_argument("--building-height-scale", type=float, default=BUILDING_HEIGHT_SCALE, help="Échelle hauteur bâtiments")
@@ -2155,14 +2987,12 @@ if __name__ == "__main__":
     parser.add_argument("--meters-per-level", type=float, default=METERS_PER_LEVEL, help="Mètres par étage")
     parser.add_argument("--buildings-z-bot-pct", type=float, default=BUILDINGS_Z_BOT_RATIO_PCT, help="Ratio Z bas bâtiments (%%)")
 
-    # --- GPX ---
     parser.add_argument("--gpx", nargs="*", default=[], help="Chemins vers des fichiers GPX à tracer")
     parser.add_argument("--gpx-color", type=str, default="#FF0000", help="Couleur des tracés GPX (hex)")
     parser.add_argument("--gpx-width", type=float, default=GPX_WIDTH_PX, help="Largeur du tracé GPX (px)")
     parser.add_argument("--gpx-height", type=float, default=GPX_HEIGHT, help="Hauteur du tracé GPX")
     parser.add_argument("--gpx-z-bot-pct", type=float, default=GPX_Z_BOT_RATIO_PCT, help="Ratio Z bas GPX (%%)")
 
-    # --- Divers / sortie ---
     parser.add_argument("--gpxz-key", type=str, default=GPXZ_API_KEY, help="Clé API GPXZ")
     parser.add_argument("--cache-dir", type=str, default=CACHE_DIR, help="Dossier de cache")
     parser.add_argument("--stl-dir", type=str, default="STL", help="Dossier de sortie")
